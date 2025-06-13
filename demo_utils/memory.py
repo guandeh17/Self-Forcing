@@ -132,4 +132,4 @@ def load_model_as_complete(model, target_device, unload=True):
     print(f'Loaded {model.__class__.__name__} to {target_device} as complete.')
 
     gpu_complete_modules.append(model)
-    return
+    return;
