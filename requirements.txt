@@ -11,7 +11,7 @@ easydict
 ftfy
 dashscope
 imageio-ffmpeg
-numpy==1.24.4
+numpy
 wandb
 omegaconf
 einops
@@ -29,8 +29,8 @@ scikit-image
 huggingface_hub[cli]
 dominate
 nvidia-pyindex
-nvidia-tensorrt
-pycuda
+# nvidia-tensorrt
+# pycuda
 onnx
 onnxruntime
 onnxscript
