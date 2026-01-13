@@ -103,7 +103,7 @@ class SelfForcingTrainingPipeline:
         # else:
         #     # reset cross attn cache
         #     for block_index in range(self.num_transformer_blocks):
-        #         self.crossattn_cache[block_index]["is_init"] = False
+        #         self.crossattn_cache[block_index]["is_init"].fill_(True)
         #     # reset kv cache
         #     for block_index in range(len(self.kv_cache1)):
         #         self.kv_cache1[block_index]["global_end_index"] = torch.tensor(
@@ -262,6 +262,6 @@ class SelfForcingTrainingPipeline:
             crossattn_cache.append({
                 "k": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
                 "v": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
-                "is_init": False
+                "is_init": torch.zeros([1], dtype=torch.bool, device=device)    # False
             })
         self.crossattn_cache = crossattn_cache
