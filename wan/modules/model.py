@@ -172,12 +172,33 @@ class WanT2VCrossAttention(WanSelfAttention):
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
 
         if crossattn_cache is not None:
-            if not crossattn_cache["is_init"]:
-                crossattn_cache["is_init"] = True
+            if not crossattn_cache["is_init"].item():
                 k = self.norm_k(self.k(context)).view(b, -1, n, d)
                 v = self.v(context).view(b, -1, n, d)
-                crossattn_cache["k"] = k
-                crossattn_cache["v"] = v
+
+                if k.shape != crossattn_cache["k"].shape:
+                    raise RuntimeError(
+                        f"crossattn_cache['k'] shape mismatch: new={tuple(k.shape)} "
+                        f"buf={tuple(crossattn_cache['k'].shape)}"
+                    )
+                if v.shape != crossattn_cache["v"].shape:
+                    raise RuntimeError(
+                        f"crossattn_cache['v'] shape mismatch: new={tuple(v.shape)} "
+                        f"buf={tuple(crossattn_cache['v'].shape)}"
+                    )
+                if k.device != crossattn_cache["k"].device or v.device != crossattn_cache["v"].device:
+                    raise RuntimeError(
+                        f"crossattn_cache device mismatch: new(k/v)={k.device}/{v.device} "
+                        f"buf(k/v)={crossattn_cache['k'].device}/{crossattn_cache['v'].device}"
+                    )
+                if k.dtype != crossattn_cache["k"].dtype:
+                    k = k.to(dtype=crossattn_cache["k"].dtype)
+                if v.dtype != crossattn_cache["v"].dtype:
+                    v = v.to(dtype=crossattn_cache["v"].dtype)
+
+                crossattn_cache["k"].copy_(k)
+                crossattn_cache["v"].copy_(v)
+                crossattn_cache["is_init"].fill_(True)
             else:
                 k = crossattn_cache["k"]
                 v = crossattn_cache["v"]

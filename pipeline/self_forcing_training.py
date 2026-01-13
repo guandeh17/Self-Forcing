@@ -262,6 +262,6 @@ class SelfForcingTrainingPipeline:
             crossattn_cache.append({
                 "k": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
                 "v": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
-                "is_init": False
+                "is_init": torch.zeros([1], dtype=torch.bool, device=device)    # False
             })
         self.crossattn_cache = crossattn_cache
