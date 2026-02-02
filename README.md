@@ -22,6 +22,9 @@
 
 Self Forcing trains autoregressive video diffusion models by **simulating the inference process during training**, performing autoregressive rollout with KV caching. It resolves the train-test distribution mismatch and enables **real-time, streaming video generation on a single RTX 4090** while matching the quality of state-of-the-art diffusion models.
 
+
+🔥🔥**New!** Check out our latest work [Causal Forcing](https://github.com/thu-ml/Causal-Forcing) — improving Self Forcing in both visual quality and motion dynamics while keeping the same training budget and inference efficiency!
+
 ---
 
 
