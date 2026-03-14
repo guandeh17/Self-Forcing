@@ -145,7 +145,7 @@ class Trainer:
         if self.config.ema_start_step < self.step:
             state_dict = {
                 "generator": generator_state_dict,
-                "generator_ema": self.generator_ema.state_dict(),
+                "generator_ema": self.generator_ema.full_state_dict(self.model.generator),
             }
         else:
             state_dict = {
