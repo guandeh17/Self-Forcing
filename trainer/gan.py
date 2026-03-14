@@ -216,7 +216,7 @@ class Trainer:
             state_dict = {
                 "generator": generator_state_dict,
                 "critic": critic_state_dict,
-                "generator_ema": self.generator_ema.state_dict(),
+                "generator_ema": self.generator_ema.full_state_dict(self.model.generator),
             }
         else:
             state_dict = {

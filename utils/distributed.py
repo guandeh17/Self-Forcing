@@ -96,18 +96,14 @@ class EMA_FSDP:
 
     @torch.no_grad()
     def _init_shadow(self, fsdp_module):
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        with FSDP.summon_full_params(fsdp_module, writeback=False):
-            for n, p in fsdp_module.module.named_parameters():
-                self.shadow[n] = p.detach().clone().float().cpu()
+        for n, p in fsdp_module.module.named_parameters():
+            self.shadow[n] = p.detach().clone().float().cpu()
 
     @torch.no_grad()
     def update(self, fsdp_module):
         d = self.decay
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        with FSDP.summon_full_params(fsdp_module, writeback=False):
-            for n, p in fsdp_module.module.named_parameters():
-                self.shadow[n].mul_(d).add_(p.detach().float().cpu(), alpha=1. - d)
+        for n, p in fsdp_module.module.named_parameters():
+            self.shadow[n].mul_(d).add_(p.detach().float().cpu(), alpha=1. - d)
 
     # Optional helpers ---------------------------------------------------
     def state_dict(self):
@@ -117,9 +113,22 @@ class EMA_FSDP:
         self.shadow = {k: v.clone() for k, v in sd.items()}
 
     def copy_to(self, fsdp_module):
-        # load EMA weights into an (unwrapped) copy of the generator
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        with FSDP.summon_full_params(fsdp_module, writeback=True):
-            for n, p in fsdp_module.module.named_parameters():
-                if n in self.shadow:
-                    p.data.copy_(self.shadow[n].to(p.dtype, device=p.device))
+        for n, p in fsdp_module.module.named_parameters():
+            if n in self.shadow:
+                p.data.copy_(self.shadow[n].to(dtype=p.dtype, device=p.device))
+
+    @torch.no_grad()
+    def full_state_dict(self, fsdp_module):
+        live_state = {}
+        for n, p in fsdp_module.module.named_parameters():
+            live_state[n] = p.detach().clone()
+        for n, p in fsdp_module.module.named_parameters():
+            if n in self.shadow:
+                p.data.copy_(self.shadow[n].to(dtype=p.dtype, device=p.device))
+
+        checkpoint = fsdp_state_dict(fsdp_module)
+        for n, p in fsdp_module.module.named_parameters():
+            if n in live_state:
+                p.data.copy_(live_state[n].to(dtype=p.dtype, device=p.device))
+
+        return checkpoint
