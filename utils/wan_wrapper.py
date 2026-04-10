@@ -119,13 +119,90 @@ class WanDiffusionWrapper(torch.nn.Module):
             timestep_shift=8.0,
             is_causal=False,
             local_attn_size=-1,
-            sink_size=0
+            sink_size=0,
+            use_float_tokens=False,
+            use_hierarchical_float_tokens=True,
+            float_token_num_slots_short=4,
+            float_token_num_slots_mid=4,
+            float_token_num_slots_long=4,
+            float_token_alpha_short=0.3,
+            float_token_alpha_mid=0.15,
+            float_token_alpha_long=0.05,
+            float_token_update_interval_short=1,
+            float_token_update_interval_mid=30,
+            float_token_update_interval_long=90,
+            use_quality_scorer=True,
+            **kwargs  # Accept additional kwargs for compatibility
     ):
         super().__init__()
 
         if is_causal:
+            # First load the base model without float tokens
             self.model = CausalWanModel.from_pretrained(
-                f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
+                f"wan_models/{model_name}/",
+                local_attn_size=local_attn_size,
+                sink_size=sink_size,
+                use_float_tokens=False  # Load base model first
+            )
+
+            # If float tokens are enabled, reinitialize attention blocks
+            if use_float_tokens:
+                print("=" * 80)
+                print("Enabling Float Tokens with optimal configuration:")
+                print(f"  use_hierarchical_float_tokens: {use_hierarchical_float_tokens}")
+                print(f"  short: {float_token_num_slots_short} slots, alpha={float_token_alpha_short}, interval={float_token_update_interval_short}")
+                print(f"  mid: {float_token_num_slots_mid} slots, alpha={float_token_alpha_mid}, interval={float_token_update_interval_mid}")
+                print(f"  long: {float_token_num_slots_long} slots, alpha={float_token_alpha_long}, interval={float_token_update_interval_long}")
+                print(f"  use_quality_scorer: {use_quality_scorer}")
+                print("=" * 80)
+
+                # Reinitialize attention blocks with float tokens
+                from wan.modules.causal_model import CausalWanAttentionBlock
+
+                for i, block in enumerate(self.model.blocks):
+                    # Get attributes from block or self_attn
+                    local_attn_size = getattr(block, 'local_attn_size', -1)
+                    sink_size = getattr(block.self_attn, 'sink_size', 0)
+                    qk_norm = getattr(block, 'qk_norm', True)
+                    cross_attn_norm = getattr(block, 'cross_attn_norm', False)
+                    eps = getattr(block, 'eps', 1e-6)
+
+                    # Determine cross_attn_type from original block
+                    cross_attn_type = 't2v_cross_attn' if 'T2V' in type(block.cross_attn).__name__ else 'i2v_cross_attn'
+
+                    new_block = CausalWanAttentionBlock(
+                        cross_attn_type=cross_attn_type,
+                        dim=block.dim,
+                        ffn_dim=block.ffn_dim,
+                        num_heads=block.num_heads,
+                        local_attn_size=local_attn_size,
+                        sink_size=sink_size,
+                        qk_norm=qk_norm,
+                        cross_attn_norm=cross_attn_norm,
+                        eps=eps,
+                        # Float token configuration
+                        use_float_tokens=use_float_tokens,
+                        use_hierarchical_float_tokens=use_hierarchical_float_tokens,
+                        float_token_num_slots_short=float_token_num_slots_short,
+                        float_token_num_slots_mid=float_token_num_slots_mid,
+                        float_token_num_slots_long=float_token_num_slots_long,
+                        float_token_alpha_short=float_token_alpha_short,
+                        float_token_alpha_mid=float_token_alpha_mid,
+                        float_token_alpha_long=float_token_alpha_long,
+                        float_token_update_interval_short=float_token_update_interval_short,
+                        float_token_update_interval_mid=float_token_update_interval_mid,
+                        float_token_update_interval_long=float_token_update_interval_long,
+                        use_quality_scorer=use_quality_scorer,
+                    )
+
+                    # Copy weights from old block
+                    new_block.load_state_dict(block.state_dict(), strict=False)
+                    self.model.blocks[i] = new_block
+
+                # Update model config
+                self.model.use_float_tokens = use_float_tokens
+                self.model.use_hierarchical_float_tokens = use_hierarchical_float_tokens
+
         else:
             self.model = WanModel.from_pretrained(f"wan_models/{model_name}/")
         self.model.eval()

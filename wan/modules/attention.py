@@ -114,8 +114,7 @@ def flash_attention(
             softmax_scale=softmax_scale,
             causal=causal,
             deterministic=deterministic)[0].unflatten(0, (b, lq))
-    else:
-        assert FLASH_ATTN_2_AVAILABLE
+    elif FLASH_ATTN_2_AVAILABLE:
         x = flash_attn.flash_attn_varlen_func(
             q=q,
             k=k,
@@ -123,7 +122,7 @@ def flash_attention(
             cu_seqlens_q=torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(
                 0, dtype=torch.int32).to(q.device, non_blocking=True),
             cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(
-                0, dtype=torch.int32).to(q.device, non_blocking=True),
+                0, dtype=torch.int32).to(k.device, non_blocking=True),
             max_seqlen_q=lq,
             max_seqlen_k=lk,
             dropout_p=dropout_p,
@@ -131,6 +130,40 @@ def flash_attention(
             causal=causal,
             window_size=window_size,
             deterministic=deterministic).unflatten(0, (b, lq))
+    else:
+        # SDPA fallback: reconstruct batched tensors from varlen-packed q/k/v.
+        # q_lens and k_lens hold the valid length for each batch item.
+        # q is [sum_q_lens, Nq, C], k/v are [sum_k_lens, Nk, C].
+        # Rebuild padded [B, L, N, C] tensors, run SDPA, then re-flatten.
+        nq, ck = q.size(1), q.size(2)
+        nk = k.size(1)
+        q_batched = q.new_zeros(b, lq, nq, ck)
+        k_batched = k.new_zeros(b, lk, nk, ck)
+        v_batched = v.new_zeros(b, lk, nk, ck)
+        q_off, k_off = 0, 0
+        for i in range(b):
+            ql_i = q_lens[i].item()
+            kl_i = k_lens[i].item()
+            q_batched[i, :ql_i] = q[q_off:q_off + ql_i]
+            k_batched[i, :kl_i] = k[k_off:k_off + kl_i]
+            v_batched[i, :kl_i] = v[k_off:k_off + kl_i]
+            q_off += ql_i
+            k_off += kl_i
+        # Build boolean key-padding mask: True = keep, False = mask-out padding
+        key_mask = torch.arange(lk, device=k.device).unsqueeze(0) < k_lens.unsqueeze(1)  # [B, lk]
+        attn_mask = key_mask[:, None, None, :]  # [B, 1, 1, lk] broadcast over heads & q positions
+        # SDPA expects (B, H, L, C); transpose N<->L dimensions
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q_batched.transpose(1, 2),   # [B, Nq, lq, C]
+            k_batched.transpose(1, 2),   # [B, Nk, lk, C]
+            v_batched.transpose(1, 2),   # [B, Nk, lk, C]
+            attn_mask=attn_mask,
+            dropout_p=dropout_p if not deterministic else 0.0,
+            scale=softmax_scale,
+            is_causal=causal,
+        )  # [B, Nq, lq, C]
+        # Match the output shape of the flash-attn branches: [B, lq, Nq, C]
+        x = out.transpose(1, 2)  # [B, lq, Nq, C]
 
     # output
     return x.type(out_dtype)

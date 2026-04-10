@@ -4,7 +4,15 @@ import os
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from torchvision import transforms
-from torchvision.io import write_video
+try:
+    from torchvision.io import write_video
+except ImportError:
+    import imageio
+    def write_video(path, video, fps):
+        writer = imageio.get_writer(path, fps=fps, codec='libx264', quality=8)
+        for frame in video.numpy().astype('uint8'):
+            writer.append_data(frame)
+        writer.close()
 from einops import rearrange
 import torch.distributed as dist
 from torch.utils.data import DataLoader, SequentialSampler
