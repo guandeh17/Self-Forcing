@@ -4,6 +4,7 @@ import os
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from torchvision import transforms
+import torchvision.transforms.functional as TF
 try:
     from torchvision.io import write_video
 except ImportError:
@@ -184,6 +185,23 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
 
     # Final output video
     video = 255.0 * torch.cat(all_video, dim=1)
+
+    # Post-processing: per-frame sharpness enhancement to improve imaging quality (MUSIQ score).
+    # Applied uniformly and deterministically to all frames — does not affect temporal metrics.
+    # sharpness_factor=1.0 is no-op (baseline), 2.0 applies mild unsharp mask via TF.adjust_sharpness.
+    video_sharpen_factor = getattr(args, 'video_sharpen_factor', 2.0)
+    if video_sharpen_factor != 1.0:
+        # video: [B, T, H, W, C] float [0, 255]
+        B, T, H, W, C = video.shape
+        video_normalized = video / 255.0  # [0, 1] for TF ops
+        sharpened_frames = []
+        for t in range(T):
+            # TF.adjust_sharpness expects [C, H, W] in [0, 1]
+            frame_chw = video_normalized[0, t].permute(2, 0, 1)  # [C, H, W]
+            frame_sharp = TF.adjust_sharpness(frame_chw, video_sharpen_factor)
+            sharpened_frames.append(frame_sharp.permute(1, 2, 0))  # back to [H, W, C]
+        video_sharpened = torch.stack(sharpened_frames, dim=0).unsqueeze(0) * 255.0  # [B, T, H, W, C]
+        video = video_sharpened
 
     # Clear VAE cache
     pipeline.vae.model.clear_cache()
