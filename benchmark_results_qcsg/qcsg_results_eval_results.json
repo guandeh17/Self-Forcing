@@ -1,0 +1,76 @@
+{
+    "subject_consistency": [
+        0.917465070947318,
+        [
+            {
+                "video_path": "/home/research/vbench-env/benchmark_videos_qcsg/A golden retriever runs joyfully through a sunlit meadow filled with wildflowers-0.mp4",
+                "video_results": 0.9081963692639035
+            },
+            {
+                "video_path": "/home/research/vbench-env/benchmark_videos_qcsg/Ocean waves crashing against rocky cliffs at sunset, dramatic clouds overhead-0.mp4",
+                "video_results": 0.907302216509914
+            },
+            {
+                "video_path": "/home/research/vbench-env/benchmark_videos_qcsg/A timelapse of clouds moving over mountain peaks, sunlight casting long shadows-0.mp4",
+                "video_results": 0.9368966270681363
+            }
+        ]
+    ],
+    "temporal_flickering": [
+        0.9823931468078513,
+        [
+            {
+                "video_path": "/home/research/vbench-env/benchmark_videos_qcsg/A golden retriever runs joyfully through a sunlit meadow filled with wildflowers-0.mp4",
+                "video_results": 0.967165075563917
+            },
+            {
+                "video_path": "/home/research/vbench-env/benchmark_videos_qcsg/Ocean waves crashing against rocky cliffs at sunset, dramatic clouds overhead-0.mp4",
+                "video_results": 0.9862536851097555
+            },
+            {
+                "video_path": "/home/research/vbench-env/benchmark_videos_qcsg/A timelapse of clouds moving over mountain peaks, sunlight casting long shadows-0.mp4",
+                "video_results": 0.9937606797498815
+            }
+        ]
+    ],
+    "motion_smoothness": [
+        0.9915048371793634,
+        [
+            {
+                "video_path": "/home/research/vbench-env/benchmark_videos_qcsg/A golden retriever runs joyfully through a sunlit meadow filled with wildflowers-0.mp4",
+                "video_results": 0.9870505941912711
+            },
+            {
+                "video_path": "/home/research/vbench-env/benchmark_videos_qcsg/Ocean waves crashing against rocky cliffs at sunset, dramatic clouds overhead-0.mp4",
+                "video_results": 0.9929288760604359
+            },
+            {
+                "video_path": "/home/research/vbench-env/benchmark_videos_qcsg/A timelapse of clouds moving over mountain peaks, sunlight casting long shadows-0.mp4",
+                "video_results": 0.9945350412863829
+            }
+        ]
+    ],
+    "background_consistency": [
+        0.9448645163451233,
+        [
+            {
+                "video_path": "/home/research/vbench-env/benchmark_videos_qcsg/A golden retriever runs joyfully through a sunlit meadow filled with wildflowers-0.mp4",
+                "video_results": 0.9324122977793409,
+                "video_sim": 289.980224609375,
+                "cnt_per_video": 311
+            },
+            {
+                "video_path": "/home/research/vbench-env/benchmark_videos_qcsg/Ocean waves crashing against rocky cliffs at sunset, dramatic clouds overhead-0.mp4",
+                "video_results": 0.9540858621382636,
+                "video_sim": 296.720703125,
+                "cnt_per_video": 311
+            },
+            {
+                "video_path": "/home/research/vbench-env/benchmark_videos_qcsg/A timelapse of clouds moving over mountain peaks, sunlight casting long shadows-0.mp4",
+                "video_results": 0.9480953891177653,
+                "video_sim": 294.857666015625,
+                "cnt_per_video": 311
+            }
+        ]
+    ]
+}

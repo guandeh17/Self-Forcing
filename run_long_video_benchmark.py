@@ -202,8 +202,56 @@ def create_config(mode: str):
         print("  - Temporal coherence: ENABLED")
         print("  - Progressive activation: ENABLED")
         print("=" * 80)
+    elif mode == "agft":
+        # Attention-Guided Float Tokens (Cycle 1 improvement)
+        model_kwargs = {
+            "timestep_shift": 5.0,
+            "local_attn_size": 21,  # Sliding window of 21 frames
+            "use_float_tokens": True,
+            "use_attention_guided_float_tokens": True,
+            "agft_guidance_alpha": 0.1,
+            "agft_temporal_weights": [0.5, 0.3, 0.2],
+            "agft_num_slots_short": 4,
+            "agft_num_slots_mid": 4,
+            "agft_num_slots_long": 4,
+            "agft_use_guidance_dropout": False,  # Disable for inference
+            "agft_guidance_dropout_p": 0.0,
+            "agft_update_interval_short": 1,
+            "agft_update_interval_mid": 10,
+            "agft_update_interval_long": 30,
+        }
+        print("=" * 80)
+        print("Mode: AGFT (Attention-Guided Float Tokens) - Cycle 1")
+        print("  - Local attention: ENABLED (local_attn_size=21)")
+        print("  - Attention-guided float tokens: ENABLED")
+        print("  - Guidance alpha: 0.1")
+        print("  - Hierarchical slots: 4/4/4 (short/mid/long)")
+        print("=" * 80)
+    elif mode == "qcsg":
+        # Query-Conditioned Slot Gating (Cycle 11 improvement)
+        model_kwargs = {
+            "timestep_shift": 5.0,
+            "local_attn_size": 21,  # Sliding window of 21 frames
+            "use_float_tokens": True,
+            "use_kv_bank_v2": True,
+            "use_hierarchical_float_tokens": True,
+            "float_token_num_slots_short": 4,
+            "float_token_num_slots_mid": 4,
+            "float_token_num_slots_long": 4,
+            "float_token_update_interval_short": 1,
+            "float_token_update_interval_mid": 2,
+            "float_token_update_interval_long": 4,
+        }
+        print("=" * 80)
+        print("Mode: QCSG (Query-Conditioned Slot Gating - Cycle 11)")
+        print("  - Local attention: ENABLED (local_attn_size=21)")
+        print("  - Float tokens: ENABLED (V2 + QCSG)")
+        print("  - Soft gating: ENABLED (temperature=0.5)")
+        print("  - Temporal decay tau: 150.0")
+        print("  - Magnitude-aware K scaling: ENABLED")
+        print("=" * 80)
     else:
-        raise ValueError(f"Unknown mode: {mode}. Must be 'baseline', 'float_v2', 'float_v2_sink', 'float_v2_midlayers', 'float_v2_shortonly', or 'aft'")
+        raise ValueError(f"Unknown mode: {mode}. Must be 'baseline', 'float_v2', 'float_v2_sink', 'float_v2_midlayers', 'float_v2_shortonly', 'aft', 'agft', or 'qcsg'")
     
     base_config["model_kwargs"] = model_kwargs
     config = OmegaConf.create(base_config)
@@ -218,8 +266,8 @@ def main():
         "--mode",
         type=str,
         required=True,
-        choices=["baseline", "float_v2", "float_v2_sink", "float_v2_midlayers", "float_v2_shortonly", "aft"],
-        help="Inference mode: baseline, float_v2, float_v2_sink, float_v2_midlayers, float_v2_shortonly, or aft"
+        choices=["baseline", "float_v2", "float_v2_sink", "float_v2_midlayers", "float_v2_shortonly", "aft", "agft", "qcsg"],
+        help="Inference mode: baseline, float_v2, float_v2_sink, float_v2_midlayers, float_v2_shortonly, aft, agft, or qcsg"
     )
     parser.add_argument(
         "--output_dir",

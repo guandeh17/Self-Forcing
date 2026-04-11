@@ -1,0 +1,38 @@
+[
+    {
+        "prompt_en": "A golden retriever runs joyfully through a sunlit meadow filled with wildflowers",
+        "dimension": [
+            "subject_consistency",
+            "temporal_flickering",
+            "motion_smoothness",
+            "background_consistency"
+        ],
+        "video_list": [
+            "/home/research/vbench-env/benchmark_videos_qcsg/A golden retriever runs joyfully through a sunlit meadow filled with wildflowers-0.mp4"
+        ]
+    },
+    {
+        "prompt_en": "Ocean waves crashing against rocky cliffs at sunset, dramatic clouds overhead",
+        "dimension": [
+            "subject_consistency",
+            "temporal_flickering",
+            "motion_smoothness",
+            "background_consistency"
+        ],
+        "video_list": [
+            "/home/research/vbench-env/benchmark_videos_qcsg/Ocean waves crashing against rocky cliffs at sunset, dramatic clouds overhead-0.mp4"
+        ]
+    },
+    {
+        "prompt_en": "A timelapse of clouds moving over mountain peaks, sunlight casting long shadows",
+        "dimension": [
+            "subject_consistency",
+            "temporal_flickering",
+            "motion_smoothness",
+            "background_consistency"
+        ],
+        "video_list": [
+            "/home/research/vbench-env/benchmark_videos_qcsg/A timelapse of clouds moving over mountain peaks, sunlight casting long shadows-0.mp4"
+        ]
+    }
+]

@@ -1,0 +1,38 @@
+[
+  {
+    "prompt_en": "a_timelapse_of_clouds_moving_over_mountain_peaks_qcsg",
+    "dimension": [
+      "subject_consistency",
+      "temporal_flickering",
+      "motion_smoothness",
+      "background_consistency"
+    ],
+    "video_list": [
+      "/workspace/Self-Forcing/outputs_qcsg/a_timelapse_of_clouds_moving_over_mountain_peaks_qcsg.mp4"
+    ]
+  },
+  {
+    "prompt_en": "ocean_waves_crashing_against_rocky_cliffs_at_sunse_qcsg",
+    "dimension": [
+      "subject_consistency",
+      "temporal_flickering",
+      "motion_smoothness",
+      "background_consistency"
+    ],
+    "video_list": [
+      "/workspace/Self-Forcing/outputs_qcsg/ocean_waves_crashing_against_rocky_cliffs_at_sunse_qcsg.mp4"
+    ]
+  },
+  {
+    "prompt_en": "a_golden_retriever_runs_joyfully_through_a_sunlit_qcsg",
+    "dimension": [
+      "subject_consistency",
+      "temporal_flickering",
+      "motion_smoothness",
+      "background_consistency"
+    ],
+    "video_list": [
+      "/workspace/Self-Forcing/outputs_qcsg/a_golden_retriever_runs_joyfully_through_a_sunlit_qcsg.mp4"
+    ]
+  }
+]

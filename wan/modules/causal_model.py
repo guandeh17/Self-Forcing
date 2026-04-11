@@ -32,7 +32,10 @@ try:
         get_layer_float_config,
         create_adaptive_float_token_config,
         apply_rope_with_float_tokens,
-        causal_rope_apply_with_float_tokens
+        causal_rope_apply_with_float_tokens,
+        AttentionGuidedFloatBank,
+        create_agft_config,
+        QueryConditionedSlotGating
     )
     FLOAT_TOKEN_AVAILABLE = True
 except ImportError:
@@ -104,7 +107,23 @@ class CausalWanSelfAttention(nn.Module):
                  progressive_warmup_frames=300,
                  coherence_history_size=30,
                  dynamic_interval_min_factor=0.5,
-                 dynamic_interval_max_factor=3.0):
+                 dynamic_interval_max_factor=3.0,
+                 use_attention_guided_float_tokens=False,
+                 use_enhanced_agft=False,
+                 agft_guidance_alpha=0.1,
+                 agft_temporal_weights=None,
+                 agft_use_guidance_dropout=True,
+                 agft_guidance_dropout_p=0.1,
+                 agft_num_slots_short=4,
+                 agft_num_slots_mid=4,
+                 agft_num_slots_long=4,
+                 agft_update_interval_short=1,
+                 agft_update_interval_mid=10,
+                 agft_update_interval_long=30,
+                 agft_use_position_adaptive=True,
+                 agft_use_scene_detection=True,
+                 agft_use_extended_coherence=True,
+                 agft_max_frames=960):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
@@ -115,6 +134,7 @@ class CausalWanSelfAttention(nn.Module):
         self.qk_norm = qk_norm
         self.eps = eps
         self.max_attention_size = 32760 if local_attn_size == -1 else local_attn_size * 1560
+        self.use_enhanced_agft = use_enhanced_agft
 
         # Float token configuration
         self.use_float_tokens = use_float_tokens and FLOAT_TOKEN_AVAILABLE
@@ -179,12 +199,73 @@ class CausalWanSelfAttention(nn.Module):
         else:
             self.float_kv_bank = None
 
+        # Attention-Guided Float Tokens (AGFT) - Cycle 1 improvement
+        self.use_attention_guided_float_tokens = use_attention_guided_float_tokens and FLOAT_TOKEN_AVAILABLE
+        if self.use_attention_guided_float_tokens:
+            # Use enhanced AGFT for 960-frame generation if enabled
+            if use_enhanced_agft and FLOAT_TOKEN_AVAILABLE:
+                from wan.modules.float_token_improvements import EnhancedAttentionGuidedFloatBank
+                self.agft_bank = EnhancedAttentionGuidedFloatBank(
+                    num_heads=num_heads,
+                    head_dim=self.head_dim,
+                    num_slots_short=agft_num_slots_short,
+                    num_slots_mid=agft_num_slots_mid,
+                    num_slots_long=agft_num_slots_long,
+                    alpha_short=float_token_alpha_short,
+                    alpha_mid=float_token_alpha_mid,
+                    alpha_long=float_token_alpha_long,
+                    update_interval_short=agft_update_interval_short,
+                    update_interval_mid=agft_update_interval_mid,
+                    update_interval_long=agft_update_interval_long,
+                    guidance_alpha=agft_guidance_alpha,
+                    temporal_weights=agft_temporal_weights,
+                    use_guidance_dropout=agft_use_guidance_dropout,
+                    guidance_dropout_p=agft_guidance_dropout_p,
+                    eps=eps,
+                    use_position_adaptive=agft_use_position_adaptive,
+                    use_scene_detection=agft_use_scene_detection,
+                    use_extended_coherence=agft_use_extended_coherence,
+                    max_frames=agft_max_frames
+                )
+            else:
+                # Standard AGFT
+                self.agft_bank = AttentionGuidedFloatBank(
+                    num_heads=num_heads,
+                    head_dim=self.head_dim,
+                    num_slots_short=agft_num_slots_short,
+                    num_slots_mid=agft_num_slots_mid,
+                    num_slots_long=agft_num_slots_long,
+                    alpha_short=float_token_alpha_short,
+                    alpha_mid=float_token_alpha_mid,
+                    alpha_long=float_token_alpha_long,
+                    update_interval_short=agft_update_interval_short,
+                    update_interval_mid=agft_update_interval_mid,
+                    update_interval_long=agft_update_interval_long,
+                    guidance_alpha=agft_guidance_alpha,
+                    temporal_weights=agft_temporal_weights,
+                    use_guidance_dropout=agft_use_guidance_dropout,
+                    guidance_dropout_p=agft_guidance_dropout_p,
+                    eps=eps
+                )
+            # Disable other float token mechanisms when AGFT is active
+            self.float_bank = None
+            self.float_kv_bank = None
+            self.num_float_tokens = 0
+            self.use_float_tokens = True  # Mark as using float tokens for eviction handling
+        else:
+            self.agft_bank = None
+
         # When V2 KV bank is active, disable V1 float bank to prevent it from injecting
         # zero-initialized tokens as a fallback
         if self.use_float_tokens and use_kv_bank_v2 and self.float_bank is not None:
             # V2 bank takes priority; disable V1 to avoid zero-token injection fallback
             self.float_bank = None
             self.num_float_tokens = 0
+
+        # Cycle 11: Query-Conditioned Slot Gating module
+        # Initialized lazily on first use (device-agnostic)
+        self._qcsg_module = None
+        self._qcsg_head_dim = self.head_dim
 
         # layers
         self.q = nn.Linear(dim, dim)
@@ -200,6 +281,8 @@ class CausalWanSelfAttention(nn.Module):
             self.float_bank.reset()
         if self.float_kv_bank is not None:
             self.float_kv_bank.reset()
+        if self.agft_bank is not None:
+            self.agft_bank.reset()
 
     def _update_float_bank_from_evicted_kv(
         self,
@@ -549,6 +632,19 @@ class CausalWanSelfAttention(nn.Module):
                         evicted_v_v2 = kv_cache["v"][:, sink_tokens + num_rolled_tokens:sink_tokens + num_rolled_tokens + num_evicted_tokens].clone()
                         self.float_kv_bank.update(evicted_k_v2, evicted_v_v2, x)
 
+                    # Update AGFT bank from evicted tokens
+                    if self.use_attention_guided_float_tokens and self.agft_bank is not None and num_evicted_tokens > 0:
+                        evicted_k_agft = kv_cache["k"][:, sink_tokens + num_rolled_tokens:sink_tokens + num_rolled_tokens + num_evicted_tokens].clone()
+                        evicted_v_agft = kv_cache["v"][:, sink_tokens + num_rolled_tokens:sink_tokens + num_rolled_tokens + num_evicted_tokens].clone()
+                        # Calculate current frame and KV norm for enhanced AGFT
+                        current_frame = current_start // frame_seqlen
+                        kv_norm = evicted_k_agft.norm().item() if evicted_k_agft.numel() > 0 else 0.0
+                        # Check if enhanced AGFT with extra parameters
+                        if self.use_enhanced_agft:
+                            self.agft_bank.update(evicted_k_agft, evicted_v_agft, x, current_frame=current_frame, kv_norm=kv_norm)
+                        else:
+                            self.agft_bank.update(evicted_k_agft, evicted_v_agft, x)
+
                     kv_cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                         kv_cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
                     kv_cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
@@ -582,21 +678,99 @@ class CausalWanSelfAttention(nn.Module):
             cached_k = kv_cache["k"][:, kv_start:local_end_index]
             cached_v = kv_cache["v"][:, kv_start:local_end_index]
 
-            if self.use_float_tokens and self.float_kv_bank is not None and self.float_kv_bank.is_ready():
-                # V2: Direct KV injection - no double-projection, no RoPE on float tokens
-                float_k, float_v = self.float_kv_bank.get_all_kv()  # [K, H, D]
-                float_k_batch = float_k.unsqueeze(0).expand(b, -1, -1, -1)  # [B, K, H, D]
-                float_v_batch = float_v.unsqueeze(0).expand(b, -1, -1, -1)  # [B, K, H, D]
-                # Scale normalization: match float token scale to cached token scale
-                # This prevents float tokens from dominating attention due to magnitude differences
+            if self.use_attention_guided_float_tokens and self.agft_bank is not None and self.agft_bank.is_ready():
+                # AGFT: Attention-Guided Float Tokens - modulate attention instead of injecting KV
+                # Compute attention with guidance modulation
+                # Scale normalization for stable attention
                 cached_k_scale = cached_k.norm(dim=-1, keepdim=True).mean() + 1e-6
-                float_k_scale = float_k_batch.norm(dim=-1, keepdim=True).mean() + 1e-6
-                scale_ratio = (cached_k_scale / float_k_scale).clamp(0.1, 10.0)
-                float_k_batch = float_k_batch * scale_ratio
-                # Float tokens are position-agnostic: no RoPE applied
-                full_k = torch.cat([float_k_batch.type_as(cached_k), cached_k], dim=1)
-                full_v = torch.cat([float_v_batch.type_as(cached_v), cached_v], dim=1)
-                x = attention(roped_query, full_k, full_v)
+                roped_query_scale = roped_query.norm(dim=-1, keepdim=True).mean() + 1e-6
+                scale_factor = (cached_k_scale / roped_query_scale).clamp(0.1, 10.0)
+
+                # Compute attention logits manually for modulation
+                # [B, H, S, T] where S is query len, T is key len
+                attn_logits = torch.matmul(
+                    roped_query.transpose(1, 2) * scale_factor,  # [B, H, S, D]
+                    cached_k.transpose(1, 2).transpose(-2, -1)   # [B, H, D, T]
+                )
+
+                # Apply AGFT guidance modulation
+                # Guidance is computed per query position and added as a bias
+                current_frame = current_start // frame_seqlen if frame_seqlen > 0 else 0
+                if self.use_enhanced_agft:
+                    guidance = self.agft_bank.compute_guidance_scores(q, training=False, current_frame=current_frame)  # [B, S, H]
+                    # Get adaptive alpha for enhanced AGFT
+                    adaptive_alpha = self.agft_bank.position_guidance.get_guidance_alpha(current_frame) if self.agft_bank.use_position_adaptive else self.agft_bank.guidance_alpha
+                    guidance_bias = adaptive_alpha * guidance.transpose(1, 2).unsqueeze(-1)  # [B, H, S, 1]
+                else:
+                    guidance = self.agft_bank.compute_guidance_scores(q, training=False)  # [B, S, H]
+                    guidance_bias = self.agft_bank.guidance_alpha * guidance.transpose(1, 2).unsqueeze(-1)  # [B, H, S, 1]
+
+                # Add guidance bias to attention logits
+                attn_logits = attn_logits + guidance_bias
+
+                # Apply softmax and compute weighted sum
+                attn_probs = F.softmax(attn_logits, dim=-1)
+                x = torch.matmul(attn_probs, cached_v.transpose(1, 2)).transpose(1, 2)  # [B, S, H, D]
+            elif self.use_float_tokens and self.float_kv_bank is not None and self.float_kv_bank.is_ready():
+                # V2: Direct KV injection with Query-Conditioned Slot Gating (Cycle 11)
+                float_k, float_v = self.float_kv_bank.get_all_kv()  # [K, H, D]
+
+                if float_k.shape[0] > 0:
+                    with torch.no_grad():
+                        # Cycle 11: Query-Conditioned Slot Gating
+                        # Initialize QCSG lazily on first use
+                        if self._qcsg_module is None and FLOAT_TOKEN_AVAILABLE:
+                            self._qcsg_module = QueryConditionedSlotGating(
+                                head_dim=self._qcsg_head_dim,
+                                temperature=0.5,
+                                decay_tau=150.0,
+                                min_gate_weight=0.01
+                            ).to(float_k.device)
+
+                        if self._qcsg_module is not None:
+                            # Gather slot staleness from all tiers
+                            staleness_parts = []
+                            for bank_name in ('bank_short', 'bank_mid', 'bank_long'):
+                                bank = getattr(self.float_kv_bank, bank_name, None)
+                                if bank is not None and bank.initialized.item():
+                                    written = bank.slot_written if hasattr(bank, 'slot_written') else None
+                                    if written is not None and written.any():
+                                        staleness_parts.append(bank.slot_staleness[written])
+                                    elif bank.initialized.item():
+                                        staleness_parts.append(bank.slot_staleness)
+                            if hasattr(self.float_kv_bank, 'use_ultra_long_tier') and self.float_kv_bank.use_ultra_long_tier:
+                                bank_ultra = getattr(self.float_kv_bank, 'bank_ultra', None)
+                                if bank_ultra is not None and bank_ultra.initialized.item():
+                                    staleness_parts.append(bank_ultra.slot_staleness)
+
+                            if len(staleness_parts) > 0:
+                                slot_staleness = torch.cat(staleness_parts, dim=0)
+                            else:
+                                slot_staleness = torch.zeros(float_k.shape[0], device=float_k.device, dtype=torch.long)
+
+                            # Ensure staleness matches float_k slots
+                            if slot_staleness.shape[0] != float_k.shape[0]:
+                                slot_staleness = torch.zeros(float_k.shape[0], device=float_k.device, dtype=torch.long)
+
+                            # Apply QCSG: soft gating + magnitude-aware scaling
+                            float_k_batch, float_v_batch, _ = self._qcsg_module(
+                                query=roped_query,
+                                float_k=float_k,
+                                float_v=float_v,
+                                slot_staleness=slot_staleness,
+                                cached_k=cached_k
+                            )
+                        else:
+                            # Fallback: simple expand without gating
+                            float_k_batch = float_k.unsqueeze(0).expand(b, -1, -1, -1)
+                            float_v_batch = float_v.unsqueeze(0).expand(b, -1, -1, -1)
+
+                    # Float tokens are position-agnostic: no RoPE applied
+                    full_k = torch.cat([float_k_batch.type_as(cached_k), cached_k], dim=1)
+                    full_v = torch.cat([float_v_batch.type_as(cached_v), cached_v], dim=1)
+                    x = attention(roped_query, full_k, full_v)
+                else:
+                    x = attention(roped_query, cached_k, cached_v)
             elif self.use_float_tokens and self.float_bank is not None:
                 # V1 fallback: old path (kept for compatibility)
                 float_tokens = self.float_bank.get_all_tokens()
@@ -654,7 +828,23 @@ class CausalWanAttentionBlock(nn.Module):
                  progressive_warmup_frames=300,
                  coherence_history_size=30,
                  dynamic_interval_min_factor=0.5,
-                 dynamic_interval_max_factor=3.0):
+                 dynamic_interval_max_factor=3.0,
+                 use_attention_guided_float_tokens=False,
+                 use_enhanced_agft=False,
+                 agft_guidance_alpha=0.1,
+                 agft_temporal_weights=None,
+                 agft_use_guidance_dropout=True,
+                 agft_guidance_dropout_p=0.1,
+                 agft_num_slots_short=4,
+                 agft_num_slots_mid=4,
+                 agft_num_slots_long=4,
+                 agft_update_interval_short=1,
+                 agft_update_interval_mid=10,
+                 agft_update_interval_long=30,
+                 agft_use_position_adaptive=True,
+                 agft_use_scene_detection=True,
+                 agft_use_extended_coherence=True,
+                 agft_max_frames=960):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -688,7 +878,23 @@ class CausalWanAttentionBlock(nn.Module):
             progressive_warmup_frames=progressive_warmup_frames,
             coherence_history_size=coherence_history_size,
             dynamic_interval_min_factor=dynamic_interval_min_factor,
-            dynamic_interval_max_factor=dynamic_interval_max_factor
+            dynamic_interval_max_factor=dynamic_interval_max_factor,
+            use_attention_guided_float_tokens=use_attention_guided_float_tokens,
+            use_enhanced_agft=use_enhanced_agft,
+            agft_guidance_alpha=agft_guidance_alpha,
+            agft_temporal_weights=agft_temporal_weights,
+            agft_use_guidance_dropout=agft_use_guidance_dropout,
+            agft_guidance_dropout_p=agft_guidance_dropout_p,
+            agft_num_slots_short=agft_num_slots_short,
+            agft_num_slots_mid=agft_num_slots_mid,
+            agft_num_slots_long=agft_num_slots_long,
+            agft_update_interval_short=agft_update_interval_short,
+            agft_update_interval_mid=agft_update_interval_mid,
+            agft_update_interval_long=agft_update_interval_long,
+            agft_use_position_adaptive=agft_use_position_adaptive,
+            agft_use_scene_detection=agft_use_scene_detection,
+            agft_use_extended_coherence=agft_use_extended_coherence,
+            agft_max_frames=agft_max_frames
         )
         self.norm3 = WanLayerNorm(
             dim, eps,
@@ -842,7 +1048,23 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  progressive_warmup_frames=300,
                  coherence_history_size=30,
                  dynamic_interval_min_factor=0.5,
-                 dynamic_interval_max_factor=3.0):
+                 dynamic_interval_max_factor=3.0,
+                 use_attention_guided_float_tokens=False,
+                 use_enhanced_agft=False,
+                 agft_guidance_alpha=0.1,
+                 agft_temporal_weights=None,
+                 agft_use_guidance_dropout=True,
+                 agft_guidance_dropout_p=0.1,
+                 agft_num_slots_short=4,
+                 agft_num_slots_mid=4,
+                 agft_num_slots_long=4,
+                 agft_update_interval_short=1,
+                 agft_update_interval_mid=10,
+                 agft_update_interval_long=30,
+                 agft_use_position_adaptive=True,
+                 agft_use_scene_detection=True,
+                 agft_use_extended_coherence=True,
+                 agft_max_frames=960):
         r"""
         Initialize the diffusion model backbone.
 
@@ -909,6 +1131,16 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 Minimum interval factor for dynamic intervals
             dynamic_interval_max_factor (`float`, *optional*, defaults to 3.0):
                 Maximum interval factor for dynamic intervals
+            use_enhanced_agft (`bool`, *optional*, defaults to False):
+                Enable enhanced AGFT with position-adaptive guidance for 960-frame videos
+            agft_use_position_adaptive (`bool`, *optional*, defaults to True):
+                Enable position-adaptive guidance strength
+            agft_use_scene_detection (`bool`, *optional*, defaults to True):
+                Enable scene change detection and adaptive bank reset
+            agft_use_extended_coherence (`bool`, *optional*, defaults to True):
+                Enable extended coherence scoring with ultra-long window
+            agft_max_frames (`int`, *optional*, defaults to 960):
+                Maximum frame count for position-adaptive guidance scheduling
         """
 
         super().__init__()
@@ -988,7 +1220,23 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     progressive_warmup_frames=progressive_warmup_frames,
                     coherence_history_size=coherence_history_size,
                     dynamic_interval_min_factor=dynamic_interval_min_factor,
-                    dynamic_interval_max_factor=dynamic_interval_max_factor
+                    dynamic_interval_max_factor=dynamic_interval_max_factor,
+                    use_attention_guided_float_tokens=use_attention_guided_float_tokens,
+                    agft_guidance_alpha=agft_guidance_alpha,
+                    agft_temporal_weights=agft_temporal_weights,
+                    agft_use_guidance_dropout=agft_use_guidance_dropout,
+                    agft_guidance_dropout_p=agft_guidance_dropout_p,
+                    agft_num_slots_short=agft_num_slots_short,
+                    agft_num_slots_mid=agft_num_slots_mid,
+                    agft_num_slots_long=agft_num_slots_long,
+                    agft_update_interval_short=agft_update_interval_short,
+                    agft_update_interval_mid=agft_update_interval_mid,
+                    agft_update_interval_long=agft_update_interval_long,
+                    use_enhanced_agft=use_enhanced_agft,
+                    agft_use_position_adaptive=agft_use_position_adaptive,
+                    agft_use_scene_detection=agft_use_scene_detection,
+                    agft_use_extended_coherence=agft_use_extended_coherence,
+                    agft_max_frames=agft_max_frames
                 )
             )
         self.blocks = nn.ModuleList(blocks)

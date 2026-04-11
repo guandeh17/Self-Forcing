@@ -419,13 +419,21 @@ class FrameQualityScorer(nn.Module):
                 frame_vec, prev_vec, dim=-1, eps=self.eps
             ).unsqueeze(-1)  # [B, 1]
 
-        # 4. 综合评分
-        # 相似度过低（<0.3）：可能是崩坏或场景切换
-        # 相似度过高（>0.95）：可能是静态或重复
-        # 方差异常：可能是模糊或噪声
+        # 4. 综合评分 (Cycle 1 fix: motion-neutral quality scoring)
+        # Only penalize true artifacts: frame collapse (sim<0.05) or frozen frames (sim>0.99)
+        # All normal motion levels (0.05 to 0.99 similarity) get quality=1.0
+        # This prevents penalizing high-motion frames that caused dynamic_degree to drop
 
-        # 理想情况：中等相似度 + 正常方差
-        sim_quality = 1.0 - torch.abs(similarity - 0.6) * 2.0  # 峰值在 0.6
+        # Collapse penalty: linear decrease from 1.0 at sim=0.05 to 0.0 at sim=-1.0
+        collapse_penalty = torch.clamp((similarity - (-1.0)) / (0.05 - (-1.0)), 0.0, 1.0)
+        # Frozen penalty: mild linear decrease from 1.0 at sim=0.99 to 0.3 at sim=1.0
+        frozen_penalty = torch.clamp(1.0 - 0.7 * (similarity - 0.99) / (1.0 - 0.99), 0.3, 1.0)
+        # Combined: use collapse_penalty below 0.05, frozen_penalty above 0.99, 1.0 in between
+        sim_quality = torch.where(
+            similarity < 0.05,
+            collapse_penalty,
+            torch.where(similarity > 0.99, frozen_penalty, torch.ones_like(similarity))
+        )
         sim_quality = torch.clamp(sim_quality, 0.0, 1.0)
 
         # 方差应该在一个合理范围内（不太低=不模糊，不太高=不噪声）
@@ -433,8 +441,8 @@ class FrameQualityScorer(nn.Module):
         var_quality = 1.0 - torch.abs(var_norm - 0.5) * 2.0  # 峰值在 0.5
         var_quality = torch.clamp(var_quality, 0.0, 1.0)
 
-        # 组合质量分数
-        quality = 0.6 * sim_quality + 0.4 * var_quality
+        # 组合质量分数 - reduce sim_quality weight to allow more motion diversity
+        quality = 0.3 * sim_quality + 0.7 * var_quality
 
         # 更新前一帧向量（使用 EMA）
         if self.prev_frame_vec is None:
@@ -949,10 +957,37 @@ class FloatKVSlot(nn.Module):
         self.register_buffer('slot_write_ptr', torch.tensor(0, dtype=torch.long))
         # Track which slots have been written at least once (for first-write direct assignment)
         self.register_buffer('slot_written', torch.zeros(num_slots, dtype=torch.bool))
-        
+
         # Content-Adaptive Alpha: 存储前一次的evicted_k平均值
         self.register_buffer('prev_evicted_k_avg', torch.zeros(num_heads, head_dim))
         self.register_buffer('has_prev', torch.tensor(False, dtype=torch.bool))
+
+        # Cycle 1: Quality-Adaptive Slot Confidence Tracking
+        # slot_confidence[i] tracks EMA of quality scores for slot i [0, 1]
+        # Higher confidence = slot has received consistently high-quality updates = more stable
+        self.register_buffer('slot_confidence', torch.zeros(num_slots))
+        # slot_staleness[i] counts eviction steps since slot i was last updated
+        # When staleness > staleness_threshold, force update even if interval not reached
+        self.register_buffer('slot_staleness', torch.zeros(num_slots, dtype=torch.long))
+        self.staleness_threshold = 50  # force update after 50 eviction steps without update
+
+        # Cycle 7: Momentum-Based EMA Update
+        # slots_k_prev tracks the previous slot values for momentum computation
+        # momentum * (slot_old - slot_prev) is added to the EMA update
+        self.register_buffer('slots_k_prev', torch.zeros(num_slots, num_heads, head_dim))
+        self.register_buffer('slots_v_prev', torch.zeros(num_slots, num_heads, head_dim))
+        self.momentum_factor = 0.1  # momentum coefficient (small to avoid instability)
+
+        # Cycle 8: Slot Norm Clipping
+        # Cycle 6 update: Reduce max_slot_norm from 3x to 2x for tighter V-value control
+        # Prevents slot norms from exploding during long video generation
+        self.max_slot_norm = head_dim ** 0.5 * 2.0  # Cycle 6: 2x expected norm (was 3x)
+
+        # Cycle 10: KV Norm Quality Proxy
+        # Track running stats of healthy KV norms to detect anomalous frames
+        self.register_buffer('kv_norm_ema', torch.tensor(0.0))
+        self.register_buffer('kv_norm_initialized', torch.tensor(False, dtype=torch.bool))
+        self.kv_norm_alpha = 0.1  # EMA alpha for norm tracking
         
         # Dynamic interval scheduler (only created if needed)
         if use_dynamic_intervals:
@@ -974,8 +1009,38 @@ class FloatKVSlot(nn.Module):
         self.has_prev.fill_(False)
         self.slot_write_ptr.zero_()
         self.slot_written.fill_(False)
+        # Cycle 1: reset confidence and staleness tracking
+        self.slot_confidence.zero_()
+        self.slot_staleness.zero_()
+        # Cycle 7: reset momentum buffers
+        self.slots_k_prev.zero_()
+        self.slots_v_prev.zero_()
+        # Cycle 10: reset KV norm tracking
+        self.kv_norm_ema.zero_()
+        self.kv_norm_initialized.fill_(False)
         if self.interval_scheduler is not None:
             self.interval_scheduler.reset()
+
+    def get_slot_effective_alpha(self, slot_idx: int, quality_score: float) -> float:
+        """
+        Cycle 1: Compute confidence-adjusted effective alpha for a specific slot.
+
+        High-confidence slots (consistently good updates) are more stable -> lower alpha.
+        Quality score scales how much the new info is trusted.
+
+        Args:
+            slot_idx: Index of the slot being updated
+            quality_score: Quality score of the current evicted frame [0, 1]
+
+        Returns:
+            effective_alpha: Adjusted alpha value in [0.05, 0.95]
+        """
+        confidence = self.slot_confidence[slot_idx].item()
+        # stability_factor: 1.0 when no confidence, 0.5 when fully confident
+        # High-confidence slots receive smaller updates (more stable)
+        stability_factor = 1.0 - 0.5 * confidence
+        effective_alpha = self.alpha * quality_score * stability_factor
+        return max(0.05, min(0.95, effective_alpha))
     
     def _compute_adaptive_alpha(self, evicted_k: torch.Tensor) -> float:
         """
@@ -1009,10 +1074,12 @@ class FloatKVSlot(nn.Module):
             # 计算自适应alpha: 场景变化时增大，稳定时减小
             # alpha_adaptive = alpha_base * (1 + 2 * (1 - cosine_sim))
             alpha_adaptive = self.alpha * (1.0 + 2.0 * (1.0 - cosine_sim.item()))
-            
-            # 限制范围: [alpha_base * 0.5, min(alpha_base * 3, 0.9)]
+
+            # Cycle 3: Cap alpha_max at 0.5 to prevent volatile slot overwrite during scene changes
+            # Prior: min(alpha_base * 3, 0.9) — at alpha_base=0.5, allowed 90% slot overwrite
+            # Now: min(alpha_base * 2, 0.5) — at most 50% blending even during fast scene changes
             alpha_min = self.alpha * 0.5
-            alpha_max = min(self.alpha * 3.0, 0.9)
+            alpha_max = min(self.alpha * 2.0, 0.5)
             alpha_adaptive = max(alpha_min, min(alpha_max, alpha_adaptive))
             
             # 更新prev_evicted_k_avg为滚动平均(alpha=0.5)
@@ -1058,8 +1125,18 @@ class FloatKVSlot(nn.Module):
         else:
             current_interval = self.base_update_interval
 
-        # 检查更新间隔
-        if self.update_count % current_interval != 0:
+        # Cycle 1: Increment staleness for all slots each eviction step
+        if self.initialized:
+            self.slot_staleness += 1
+
+        # Cycle 1: Check if any slot is too stale and needs a forced update
+        force_update_due_to_staleness = (
+            self.initialized and
+            (self.slot_staleness >= self.staleness_threshold).any()
+        )
+
+        # 检查更新间隔 (skip interval check if staleness forces update)
+        if not force_update_due_to_staleness and self.update_count % current_interval != 0:
             return {
                 'updated': False,
                 'update_count': self.update_count.item(),
@@ -1082,6 +1159,24 @@ class FloatKVSlot(nn.Module):
             # Eviction Quality Gate: reject frames with anomalous KV norms
             # (too low = collapsed/blank frames, too high = unstable/noise frames)
             ek_norm = ek.norm(dim=-1).mean().item()  # Average norm per token
+
+            # Cycle 10: Update KV norm EMA for quality tracking
+            if not self.kv_norm_initialized:
+                self.kv_norm_ema.fill_(ek_norm)
+                self.kv_norm_initialized.fill_(True)
+            else:
+                self.kv_norm_ema.mul_(1 - self.kv_norm_alpha).add_(ek_norm * self.kv_norm_alpha)
+
+            # Cycle 10: Use KV norm deviation as quality signal
+            # Frames deviating >3x from EMA are likely anomalous
+            norm_ema = self.kv_norm_ema.item()
+            if norm_ema > 0:
+                norm_deviation = abs(ek_norm - norm_ema) / (norm_ema + 1e-6)
+                # Scale quality by deviation: max quality at 0 deviation, 0 quality at 3x deviation
+                kv_quality = max(0.1, 1.0 - norm_deviation / 3.0)
+                # Blend with provided quality score
+                quality_score = quality_score * kv_quality
+
             if self.initialized:
                 # Reference scale: use current slot norms as expected range
                 slot_norm = self.slots_k.norm(dim=-1).mean().item()
@@ -1118,6 +1213,13 @@ class FloatKVSlot(nn.Module):
                         self.slots_v[i] = ev[idx]
                 
                 self.initialized.fill_(True)
+                # Bug fix (Cycle 1 follow-up): Mark all initialized slots as written
+                # Previously, slot_written stayed False after init, causing all subsequent
+                # FIFO updates to use direct assignment (overwriting EMA entirely)
+                self.slot_written.fill_(True)
+                # Initialize prev buffers from initial slot values
+                self.slots_k_prev.copy_(self.slots_k)
+                self.slots_v_prev.copy_(self.slots_v)
                 return {
                     'updated': True,
                     'initialized': True,
@@ -1132,25 +1234,120 @@ class FloatKVSlot(nn.Module):
             # 计算内容自适应alpha
             adaptive_alpha = self._compute_adaptive_alpha(ek)
 
-            # 结合质量分数计算有效alpha
-            eff_alpha = max(0.05, min(0.95, adaptive_alpha * quality_score))
+            # 结合质量分数计算有效alpha (base combined alpha)
+            base_eff_alpha = max(0.05, min(0.95, adaptive_alpha * quality_score))
 
             if self.use_fifo_slots:
                 # FIFO slot assignment: write to next slot in ring buffer
                 # This ensures each slot holds a DIFFERENT temporal snapshot
                 # (temporal diversity), rather than all slots chasing the same eviction
-                slot_idx = self.slot_write_ptr.item() % self.num_slots
+
+                # Cycle 1: If staleness forced the update, target the stalest slot instead
+                if force_update_due_to_staleness and (self.slot_staleness >= self.staleness_threshold).any():
+                    slot_idx = self.slot_staleness.argmax().item()
+                elif self.initialized and self.num_slots > 1:
+                    # Cycle 2: Diversity-Aware Slot Selection
+                    # Find the slot with content MOST DIFFERENT from new_k_raw
+                    # (maximize temporal diversity across slots)
+                    new_k_mean = new_k_raw[0].mean(dim=0)  # [head_dim]
+                    slots_k_mean = self.slots_k.mean(dim=1)  # [num_slots, head_dim]
+                    # Cosine similarity between new content and each slot
+                    cos_sims = F.cosine_similarity(
+                        new_k_mean.unsqueeze(0),  # [1, head_dim]
+                        slots_k_mean,             # [num_slots, head_dim]
+                        dim=-1
+                    )  # [num_slots]
+                    # Target the most dissimilar slot (maximizes diversity)
+                    # But only among written slots; fall back to FIFO for unwritten
+                    if self.slot_written.any():
+                        written_indices = self.slot_written.nonzero(as_tuple=True)[0]
+                        # Among written slots, pick most dissimilar
+                        written_sims = cos_sims[written_indices]
+                        most_dissimilar_local = written_sims.argmin().item()
+                        slot_idx = written_indices[most_dissimilar_local].item()
+                    else:
+                        slot_idx = self.slot_write_ptr.item() % self.num_slots
+                else:
+                    slot_idx = self.slot_write_ptr.item() % self.num_slots
+
+                # Cycle 1: Use confidence-adjusted alpha for this specific slot
+                eff_alpha = self.get_slot_effective_alpha(slot_idx, quality_score)
+
+                # Cycle 10: Skip redundant writes — if new content is too similar to
+                # the target slot, skip the update to preserve temporal diversity
+                # This prevents slots from all converging to the same recent scene
+                if self.slot_written[slot_idx]:
+                    target_slot_k = self.slots_k[slot_idx]  # [H, D]
+                    new_k_mean = new_k_raw[0].mean(dim=0)   # [D] (mean over heads)
+                    target_k_mean = target_slot_k.mean(dim=0)
+                    redundancy_sim = F.cosine_similarity(
+                        new_k_mean.unsqueeze(0), target_k_mean.unsqueeze(0), dim=-1
+                    ).item()
+                    # Skip if >95% similar (near-duplicate frame)
+                    if redundancy_sim > 0.95 and self.slot_written.sum() == self.num_slots:
+                        return {
+                            'updated': False,
+                            'skipped_redundant': True,
+                            'redundancy_sim': redundancy_sim,
+                            'slot_k_norms': self.slots_k.norm(dim=-1).mean(dim=-1).detach()
+                        }
+
                 if not self.slot_written[slot_idx]:
                     # First write to this slot: direct assignment (no blending with zero init)
                     self.slots_k[slot_idx].copy_(new_k_raw[0])
                     self.slots_v[slot_idx].copy_(new_v_raw[0])
                     self.slot_written[slot_idx] = True
+                    # Initialize prev buffers
+                    self.slots_k_prev[slot_idx].copy_(new_k_raw[0])
+                    self.slots_v_prev[slot_idx].copy_(new_v_raw[0])
                 else:
-                    # Subsequent writes: EMA blend (temporal smoothing within slot)
-                    self.slots_k[slot_idx].mul_(1 - eff_alpha).add_(new_k_raw[0], alpha=eff_alpha)
-                    self.slots_v[slot_idx].mul_(1 - eff_alpha).add_(new_v_raw[0], alpha=eff_alpha)
-                self.slot_write_ptr.add_(1)
+                    # Cycle 7: Momentum-Based EMA Update
+                    # Save previous slot values for momentum computation
+                    k_old = self.slots_k[slot_idx].clone()
+                    v_old = self.slots_v[slot_idx].clone()
+
+                    # EMA blend
+                    new_k = k_old * (1 - eff_alpha) + new_k_raw[0] * eff_alpha
+                    new_v = v_old * (1 - eff_alpha) + new_v_raw[0] * eff_alpha
+
+                    # Add momentum: push in direction of recent change
+                    momentum_k = k_old - self.slots_k_prev[slot_idx]
+                    momentum_v = v_old - self.slots_v_prev[slot_idx]
+                    new_k = new_k + self.momentum_factor * momentum_k
+                    new_v = new_v + self.momentum_factor * momentum_v
+
+                    # Cycle 8: Slot Norm Clipping
+                    # Prevent norms from exploding during long video
+                    k_norms = new_k.norm(dim=-1, keepdim=True)  # [H, 1]
+                    v_norms = new_v.norm(dim=-1, keepdim=True)
+                    new_k = torch.where(
+                        k_norms > self.max_slot_norm,
+                        new_k / k_norms * self.max_slot_norm,
+                        new_k
+                    )
+                    new_v = torch.where(
+                        v_norms > self.max_slot_norm,
+                        new_v / v_norms * self.max_slot_norm,
+                        new_v
+                    )
+
+                    # Update prev before overwriting current
+                    self.slots_k_prev[slot_idx].copy_(k_old)
+                    self.slots_v_prev[slot_idx].copy_(v_old)
+
+                    self.slots_k[slot_idx].copy_(new_k)
+                    self.slots_v[slot_idx].copy_(new_v)
+
+                # Cycle 1: Update confidence and reset staleness for this slot
+                self.slot_confidence[slot_idx] = (
+                    0.9 * self.slot_confidence[slot_idx] + 0.1 * quality_score
+                )
+                self.slot_staleness[slot_idx] = 0
+
+                if not force_update_due_to_staleness:
+                    self.slot_write_ptr.add_(1)
             else:
+                eff_alpha = base_eff_alpha
                 # Slot Attention: each slot selects relevant evicted tokens via softmax
                 slots_k_avg = self.slots_k.mean(dim=1)  # [K, D]
                 ek_avg = ek.mean(dim=1)  # [N, D]
@@ -1163,9 +1360,16 @@ class FloatKVSlot(nn.Module):
                 new_k = torch.einsum('kn,nhd->khd', attn_weights, ek)
                 new_v = torch.einsum('kn,nhd->khd', attn_weights, ev)
 
-                # EMA更新 (all slots updated)
-                self.slots_k.mul_(1 - eff_alpha).add_(new_k, alpha=eff_alpha)
-                self.slots_v.mul_(1 - eff_alpha).add_(new_v, alpha=eff_alpha)
+                # EMA更新 (all slots updated with confidence-adjusted alpha for each slot)
+                for s_idx in range(self.num_slots):
+                    slot_alpha = self.get_slot_effective_alpha(s_idx, quality_score)
+                    self.slots_k[s_idx].mul_(1 - slot_alpha).add_(new_k[s_idx], alpha=slot_alpha)
+                    self.slots_v[s_idx].mul_(1 - slot_alpha).add_(new_v[s_idx], alpha=slot_alpha)
+                    # Update confidence and staleness for each slot
+                    self.slot_confidence[s_idx] = (
+                        0.9 * self.slot_confidence[s_idx] + 0.1 * quality_score
+                    )
+                    self.slot_staleness[s_idx] = 0
         
         return {
             'updated': True,
@@ -1173,26 +1377,65 @@ class FloatKVSlot(nn.Module):
             'alpha': eff_alpha,
             'adaptive_alpha': adaptive_alpha,
             'quality_score': quality_score,
+            'force_update': force_update_due_to_staleness,
+            'slot_confidences': self.slot_confidence.detach().clone(),
             'slot_k_norms': self.slots_k.norm(dim=-1).mean(dim=-1).detach()
         }
-    
+
     def get_kv(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         获取已写入slot的K/V对 (只返回已初始化的slot，过滤零值)
 
+        Cycle 3: Apply slot normalization to scale K/V norms to match the
+        expected KV cache norm scale. This prevents float token slots with
+        large norms from dominating the softmax during attention.
+
         Returns:
-            slots_k: [num_written_slots, num_heads, head_dim]
+            slots_k: [num_written_slots, num_heads, head_dim] (norm-scaled)
             slots_v: [num_written_slots, num_heads, head_dim]
         """
         if self.use_fifo_slots and hasattr(self, 'slot_written'):
             # Only return slots that have been written to at least once
             written_mask = self.slot_written  # [num_slots] bool
             if written_mask.any():
-                return self.slots_k[written_mask], self.slots_v[written_mask]
+                sk = self.slots_k[written_mask]
+                sv = self.slots_v[written_mask]
+                # Cycle 3: Normalize K slots to unit norm per head, preserve direction
+                # This equalizes float token influence regardless of slot magnitude
+                k_norms = sk.norm(dim=-1, keepdim=True).clamp(min=1e-6)  # [S, H, 1]
+                target_norm = (self.head_dim ** 0.5)  # match expected scale
+                sk_normalized = sk / k_norms * target_norm
+
+                # Cycle 4: Apply temporal decay weighting based on staleness
+                # Stale slots (old information) are downweighted
+                # decay_factor[i] = exp(-staleness[i] / decay_tau)
+                # where decay_tau = staleness_threshold / 2 = 25
+                staleness_written = self.slot_staleness[written_mask].float()
+                # Cycle 4: Increase decay_tau from staleness/2=25 to staleness*2=100
+                # Prior: tau=25 → after 25 evictions (~4s), V weight ≈ 0.37 (too aggressive)
+                # Now: tau=100 → after 100 evictions (~16s), V weight ≈ 0.37 (gentler decay)
+                decay_tau = max(1.0, self.staleness_threshold * 2.0)
+                decay_weights = torch.exp(-staleness_written / decay_tau)  # [S]
+                # Apply decay to V values (K is already norm-scaled, don't double-scale)
+                sv_decayed = sv * decay_weights.unsqueeze(-1).unsqueeze(-1)  # [S, H, D]
+
+                return sk_normalized, sv_decayed
             else:
                 # No slots written yet - return empty (caller should check is_ready())
                 return self.slots_k[:0], self.slots_v[:0]
-        return self.slots_k, self.slots_v
+        # Non-FIFO mode: guard against returning zero-initialized slots
+        if not self.initialized:
+            return self.slots_k[:0], self.slots_v[:0]
+        # Cycle 3+4: Also normalize and decay in non-FIFO mode
+        k_norms = self.slots_k.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        target_norm = (self.head_dim ** 0.5)
+        sk_normalized = self.slots_k / k_norms * target_norm
+        # Cycle 4: Apply temporal decay in non-FIFO mode
+        # Cycle 4 update: use staleness*2 for decay_tau (gentler decay)
+        decay_tau = max(1.0, self.staleness_threshold * 2.0)
+        decay_weights = torch.exp(-self.slot_staleness.float() / decay_tau)
+        sv_decayed = self.slots_v * decay_weights.unsqueeze(-1).unsqueeze(-1)
+        return sk_normalized, sv_decayed
 
 
 class HierarchicalFloatKVBank(nn.Module):
@@ -1235,6 +1478,11 @@ class HierarchicalFloatKVBank(nn.Module):
         coherence_history_size: int = 30,
         dynamic_interval_min_factor: float = 0.5,
         dynamic_interval_max_factor: float = 3.0,
+        # Cycle 5: Ultra-Long Tier for 1-minute video generation
+        num_slots_ultra: int = 2,       # 2 slots for global theme preservation
+        alpha_ultra: float = 0.02,      # very slow update (global average)
+        update_interval_ultra: int = 100,  # update every 100 evictions (~1 min)
+        use_ultra_long_tier: bool = True,  # Enable ultra-long tier by default
         eps: float = 1e-6
     ):
         super().__init__()
@@ -1243,7 +1491,7 @@ class HierarchicalFloatKVBank(nn.Module):
         self.use_quality_scorer = use_quality_scorer
         self.use_temporal_coherence = use_temporal_coherence
         self.use_progressive_activation = use_progressive_activation
-        
+
         # 创建三层FloatKVSlot
         self.bank_short = FloatKVSlot(
             num_slots=num_slots_short,
@@ -1256,7 +1504,7 @@ class HierarchicalFloatKVBank(nn.Module):
             dynamic_interval_min_factor=dynamic_interval_min_factor,
             dynamic_interval_max_factor=dynamic_interval_max_factor
         )
-        
+
         self.bank_mid = FloatKVSlot(
             num_slots=num_slots_mid,
             num_heads=num_heads,
@@ -1268,7 +1516,7 @@ class HierarchicalFloatKVBank(nn.Module):
             dynamic_interval_min_factor=dynamic_interval_min_factor,
             dynamic_interval_max_factor=dynamic_interval_max_factor
         )
-        
+
         self.bank_long = FloatKVSlot(
             num_slots=num_slots_long,
             num_heads=num_heads,
@@ -1280,7 +1528,24 @@ class HierarchicalFloatKVBank(nn.Module):
             dynamic_interval_min_factor=dynamic_interval_min_factor,
             dynamic_interval_max_factor=dynamic_interval_max_factor
         )
-        
+
+        # Cycle 5: Ultra-Long Tier for 1-minute video generation
+        # Captures global scene theme across the full video
+        self.use_ultra_long_tier = use_ultra_long_tier and num_slots_ultra > 0
+        if self.use_ultra_long_tier:
+            self.bank_ultra = FloatKVSlot(
+                num_slots=num_slots_ultra,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                alpha=alpha_ultra,
+                update_interval=update_interval_ultra,
+                eps=eps,
+                use_fifo_slots=False,  # Use slot-attention for global theme (no FIFO)
+                use_dynamic_intervals=False  # Fixed interval for global theme
+            )
+        else:
+            self.bank_ultra = None
+
         # 质量评分器（可选择类型）
         if use_temporal_coherence:
             self.coherence_scorer = TemporalCoherenceScorer(num_heads * head_dim, coherence_history_size)
@@ -1291,21 +1556,25 @@ class HierarchicalFloatKVBank(nn.Module):
         else:
             self.quality_scorer = None
             self.coherence_scorer = None
-        
+
         # 渐进式激活
         if use_progressive_activation:
             self.progressive_activation = ProgressiveBankActivation(progressive_warmup_frames)
         else:
             self.progressive_activation = None
-        
-        self.total_slots = num_slots_short + num_slots_mid + num_slots_long
-        self._alphas = {'short': alpha_short, 'mid': alpha_mid, 'long': alpha_long}
+
+        ultra_slots = num_slots_ultra if self.use_ultra_long_tier else 0
+        self.total_slots = num_slots_short + num_slots_mid + num_slots_long + ultra_slots
+        self._alphas = {'short': alpha_short, 'mid': alpha_mid, 'long': alpha_long, 'ultra': alpha_ultra}
     
     def reset(self):
         """重置所有层状态"""
         self.bank_short.reset()
         self.bank_mid.reset()
         self.bank_long.reset()
+        # Cycle 5: Reset ultra-long tier
+        if self.use_ultra_long_tier and self.bank_ultra is not None:
+            self.bank_ultra.reset()
         if self.quality_scorer is not None:
             self.quality_scorer.reset()
         if self.coherence_scorer is not None:
@@ -1334,7 +1603,13 @@ class HierarchicalFloatKVBank(nn.Module):
         quality_score = 1.0
         coherence_scores = None
         coherence_overall = 1.0
-        
+
+        # Cycle 8: Progressive frame contribution scaling
+        # Early frames get 30% quality weight, increasing to 100% over 30 updates
+        # This prevents initial scene from dominating all slots (first-frame bias)
+        self._update_call_count = getattr(self, '_update_call_count', 0) + 1
+        warmup_scale = 0.3 + 0.7 * min(1.0, self._update_call_count / 30.0)
+
         if frame_hidden is not None:
             with torch.no_grad():
                 if self.coherence_scorer is not None:
@@ -1344,6 +1619,9 @@ class HierarchicalFloatKVBank(nn.Module):
                     self.coherence_scorer.update_history(frame_hidden)
                 elif self.quality_scorer is not None:
                     quality_score = self.quality_scorer(frame_hidden).mean().item()
+
+        # Apply warmup scale to quality_score for progressive activation
+        quality_score = quality_score * warmup_scale
         
         # 如果使用渐进式激活，调整各层的有效alpha
         if self.progressive_activation is not None:
@@ -1365,18 +1643,23 @@ class HierarchicalFloatKVBank(nn.Module):
         stats_short = self.bank_short.update(evicted_k, evicted_v, quality_score)
         stats_mid = self.bank_mid.update(evicted_k, evicted_v, quality_score)
         stats_long = self.bank_long.update(evicted_k, evicted_v, quality_score)
-        
+        # Cycle 5: Update ultra-long tier
+        stats_ultra = {}
+        if self.use_ultra_long_tier and self.bank_ultra is not None:
+            stats_ultra = self.bank_ultra.update(evicted_k, evicted_v, quality_score)
+
         # 恢复原始alpha值
         if self.progressive_activation is not None:
             self.bank_short.alpha = orig_alpha_short
             self.bank_mid.alpha = orig_alpha_mid
             self.bank_long.alpha = orig_alpha_long
-        
+
         # 构建返回统计信息
         result = {
             'short': stats_short,
             'mid': stats_mid,
             'long': stats_long,
+            'ultra': stats_ultra,
             'quality_score': quality_score,
             'adaptive_alpha_short': stats_short.get('adaptive_alpha', self.bank_short.alpha),
             'adaptive_alpha_mid': stats_mid.get('adaptive_alpha', self.bank_mid.alpha),
@@ -1414,16 +1697,29 @@ class HierarchicalFloatKVBank(nn.Module):
         k_short, v_short = self.bank_short.get_kv()
         k_mid, v_mid = self.bank_mid.get_kv()
         k_long, v_long = self.bank_long.get_kv()
-        
+
         # 如果使用渐进式激活，根据权重调整长期bank的贡献
         if self.progressive_activation is not None and k_long.shape[0] > 0:
             long_weight = self.progressive_activation.get_long_term_weight()
             if long_weight < 1.0:
                 v_long = v_long * long_weight
-        
-        float_k = torch.cat([k_short, k_mid, k_long], dim=0)
-        float_v = torch.cat([v_short, v_mid, v_long], dim=0)
-        
+
+        # Cycle 5: Include ultra-long tier if active
+        all_ks = [k_short, k_mid, k_long]
+        all_vs = [v_short, v_mid, v_long]
+        if self.use_ultra_long_tier and self.bank_ultra is not None:
+            k_ultra, v_ultra = self.bank_ultra.get_kv()
+            if k_ultra.shape[0] > 0:
+                # Cycle 9: Remove the 0.5 V scaling on ultra-long tier
+                # Prior: v_ultra * 0.5 combined with temporal decay → near-zero contribution
+                # Now: rely only on temporal decay for natural downweighting of old context
+                # This allows ultra-long tier to actually contribute to long-range consistency
+                all_ks.append(k_ultra)
+                all_vs.append(v_ultra)
+
+        float_k = torch.cat(all_ks, dim=0)
+        float_v = torch.cat(all_vs, dim=0)
+
         return float_k, float_v
 
     def is_ready(self) -> bool:
@@ -1436,6 +1732,9 @@ class HierarchicalFloatKVBank(nn.Module):
             return bool(self.bank_mid.initialized.item())
         elif self.bank_long.num_slots > 0:
             return bool(self.bank_long.initialized.item())
+        # Cycle 5: Check ultra-long tier as last resort
+        elif self.use_ultra_long_tier and self.bank_ultra is not None and self.bank_ultra.num_slots > 0:
+            return bool(self.bank_ultra.initialized.item())
         return False  # All banks disabled
 
 
@@ -1473,3 +1772,872 @@ def create_hierarchical_float_bank(
         update_interval_long=90,
         use_quality_scorer=use_quality_scorer
     )
+
+
+# =============================================================================
+# Query-Conditioned Slot Gating (QCSG) - Cycle 11 Improvement
+# =============================================================================
+
+class QueryConditionedSlotGating(nn.Module):
+    """
+    Query-Conditioned Slot Gating for Float KV Banks.
+
+    Computes per-slot relevance scores based on query-key similarity,
+    applies temporal decay, and uses soft gating to modulate contributions.
+
+    Key improvements over Cycle 10:
+    - Soft gating via softmax (vs. hard threshold)
+    - Magnitude-aware K scaling (preserve relative magnitudes)
+    - Unified temporal decay (applied to relevance, not just V)
+    - Increased decay tau for 999-frame generation
+
+    Args:
+        head_dim: Dimension per attention head
+        temperature: Softmax temperature for gating (default 0.5)
+        decay_tau: Temporal decay time constant (default 150.0)
+        min_gate_weight: Minimum gate weight to prevent complete suppression
+    """
+
+    def __init__(
+        self,
+        head_dim: int,
+        temperature: float = 0.5,
+        decay_tau: float = 150.0,
+        min_gate_weight: float = 0.01,
+        eps: float = 1e-6
+    ):
+        super().__init__()
+        self.head_dim = head_dim
+        self.temperature = temperature
+        self.decay_tau = decay_tau
+        self.min_gate_weight = min_gate_weight
+        self.eps = eps
+
+    def compute_relevance_scores(
+        self,
+        query: torch.Tensor,
+        float_k: torch.Tensor,
+        slot_staleness: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute query-conditioned relevance scores for each float slot.
+
+        Args:
+            query: [B, S_q, H, D] current queries
+            float_k: [K, H, D] float token keys
+            slot_staleness: [K] eviction steps since last update
+
+        Returns:
+            relevance: [B, K] relevance scores per slot
+        """
+        B, S_q, H, D = query.shape
+        K = float_k.shape[0]
+
+        # Compute query mean per head: [B, H, D]
+        q_mean = query.mean(dim=1)  # average over sequence
+
+        # Compute dot product similarity: [B, H, K]
+        relevance_per_head = torch.einsum('bhd,khd->bhk', q_mean, float_k) / (D ** 0.5)
+
+        # Average over heads: [B, K]
+        relevance = relevance_per_head.mean(dim=1)
+
+        # Apply temporal decay
+        temporal_weight = torch.exp(-slot_staleness.float() / self.decay_tau)  # [K]
+        relevance = relevance * temporal_weight.unsqueeze(0)  # [B, K]
+
+        return relevance
+
+    def compute_gate_weights(
+        self,
+        relevance: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute soft gating weights via temperature-scaled softmax.
+
+        Args:
+            relevance: [B, K] relevance scores
+
+        Returns:
+            gate_weights: [B, K] normalized gating weights
+        """
+        # Temperature-scaled softmax
+        gate_weights = F.softmax(relevance / self.temperature, dim=-1)  # [B, K]
+
+        # Ensure minimum contribution (prevent complete suppression)
+        gate_weights = torch.clamp(gate_weights, min=self.min_gate_weight)
+
+        # Renormalize after clamping
+        gate_weights = gate_weights / (gate_weights.sum(dim=-1, keepdim=True) + self.eps)
+
+        return gate_weights
+
+    def scale_float_k(
+        self,
+        float_k: torch.Tensor,
+        cached_k_scale: float
+    ) -> torch.Tensor:
+        """
+        Apply magnitude-aware scaling to float_k.
+
+        Preserves relative magnitudes across slots, only applies global scale factor.
+
+        Args:
+            float_k: [K, H, D] float token keys
+            cached_k_scale: scalar, mean norm of cached keys
+
+        Returns:
+            float_k_scaled: [K, H, D] scaled keys
+        """
+        float_k_norms = float_k.norm(dim=-1)  # [K, H]
+        float_k_mean_norm = float_k_norms.mean().item()
+
+        scale_factor = cached_k_scale / (float_k_mean_norm + self.eps)
+        # Wider clamp than Cycle 10's 0.8-1.2 to allow better magnitude matching
+        scale_factor = max(0.5, min(2.0, scale_factor))
+
+        return float_k * scale_factor
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        float_k: torch.Tensor,
+        float_v: torch.Tensor,
+        slot_staleness: torch.Tensor,
+        cached_k: torch.Tensor
+    ) -> tuple:
+        """
+        Apply query-conditioned gating to float KV slots.
+
+        Args:
+            query: [B, S_q, H, D]
+            float_k: [K, H, D]
+            float_v: [K, H, D]
+            slot_staleness: [K]
+            cached_k: [B, S_c, H, D]
+
+        Returns:
+            float_k_processed: [B, K, H, D] processed keys
+            float_v_processed: [B, K, H, D] processed values
+            gate_weights: [B, K] gating weights (for logging)
+        """
+        B = query.shape[0]
+
+        # 1. Compute relevance scores
+        relevance = self.compute_relevance_scores(query, float_k, slot_staleness)  # [B, K]
+
+        # 2. Compute soft gating weights
+        gate_weights = self.compute_gate_weights(relevance)  # [B, K]
+
+        # 3. Scale float_k (magnitude-aware)
+        cached_k_scale = cached_k.norm(dim=-1).mean().item()
+        float_k_scaled = self.scale_float_k(float_k, cached_k_scale)  # [K, H, D]
+
+        # 4. Apply gating to V values
+        gate_weights_expanded = gate_weights.unsqueeze(-1).unsqueeze(-1)  # [B, K, 1, 1]
+        float_v_gated = float_v.unsqueeze(0) * gate_weights_expanded  # [B, K, H, D]
+
+        # 5. Expand float_k to batch dimension
+        float_k_batch = float_k_scaled.unsqueeze(0).expand(B, -1, -1, -1)  # [B, K, H, D]
+
+        return float_k_batch, float_v_gated, gate_weights
+
+
+# =============================================================================
+# Attention-Guided Float Tokens (AGFT) - Cycle 1 Implementation
+# =============================================================================
+
+class AttentionGuidedFloatBank(nn.Module):
+    """
+    Attention-Guided Float Tokens (AGFT) - A new approach to long-range consistency.
+    
+    Instead of injecting external KV pairs into attention (which contaminates subject 
+    representations), AGFT computes guidance scores from float tokens and modulates
+    attention weights within the local window.
+    
+    Key innovation: Multiplicative attention guidance rather than additive KV injection.
+    
+    Args:
+        num_heads: Number of attention heads
+        head_dim: Dimension per head
+        num_slots_short/mid/long: Number of slots per temporal scale
+        alpha_short/mid/long: EMA update coefficients
+        guidance_alpha: Strength of attention modulation (default 0.1)
+        temporal_weights: Weights for short/mid/long guidance aggregation
+        use_guidance_dropout: Whether to apply dropout during training
+        guidance_dropout_p: Dropout probability for training
+    """
+    
+    def __init__(
+        self,
+        num_heads: int = 16,
+        head_dim: int = 128,
+        num_slots_short: int = 4,
+        num_slots_mid: int = 4,
+        num_slots_long: int = 4,
+        alpha_short: float = 0.3,
+        alpha_mid: float = 0.15,
+        alpha_long: float = 0.05,
+        update_interval_short: int = 1,
+        update_interval_mid: int = 10,
+        update_interval_long: int = 30,
+        guidance_alpha: float = 0.1,
+        temporal_weights: List[float] = None,
+        use_guidance_dropout: bool = True,
+        guidance_dropout_p: float = 0.1,
+        eps: float = 1e-6
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.guidance_alpha = guidance_alpha
+        self.use_guidance_dropout = use_guidance_dropout
+        self.guidance_dropout_p = guidance_dropout_p
+        self.eps = eps
+        
+        # Temporal weights for aggregating short/mid/long guidance
+        if temporal_weights is None:
+            temporal_weights = [0.5, 0.3, 0.2]  # short, mid, long
+        self.register_buffer('temporal_weights', torch.tensor(temporal_weights))
+        
+        # Hierarchical KV banks for storing compressed representations
+        self.bank_short = FloatKVSlot(
+            num_slots=num_slots_short,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            alpha=alpha_short,
+            update_interval=update_interval_short,
+            eps=eps,
+            use_fifo_slots=True
+        )
+        
+        self.bank_mid = FloatKVSlot(
+            num_slots=num_slots_mid,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            alpha=alpha_mid,
+            update_interval=update_interval_mid,
+            eps=eps,
+            use_fifo_slots=True
+        )
+        
+        self.bank_long = FloatKVSlot(
+            num_slots=num_slots_long,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            alpha=alpha_long,
+            update_interval=update_interval_long,
+            eps=eps,
+            use_fifo_slots=True
+        )
+        
+        # Learnable projection for query-to-float-token compatibility
+        # This allows the model to adapt how queries match against stored tokens
+        self.query_proj = nn.Linear(head_dim, head_dim, bias=False)
+        
+        # Initialize with small weights for stable start
+        nn.init.normal_(self.query_proj.weight, std=0.02)
+        
+        self.total_slots = num_slots_short + num_slots_mid + num_slots_long
+    
+    def reset(self):
+        """Reset all bank states."""
+        self.bank_short.reset()
+        self.bank_mid.reset()
+        self.bank_long.reset()
+    
+    def update(
+        self,
+        evicted_k: torch.Tensor,
+        evicted_v: torch.Tensor,
+        frame_hidden: Optional[torch.Tensor] = None
+    ) -> Dict[str, any]:
+        """
+        Update all hierarchical banks with evicted KV pairs.
+        
+        Args:
+            evicted_k: Evicted keys [B, N, num_heads, head_dim]
+            evicted_v: Evicted values [B, N, num_heads, head_dim]
+            frame_hidden: Current frame hidden state (optional)
+        
+        Returns:
+            stats: Update statistics
+        """
+        stats_short = self.bank_short.update(evicted_k, evicted_v)
+        stats_mid = self.bank_mid.update(evicted_k, evicted_v)
+        stats_long = self.bank_long.update(evicted_k, evicted_v)
+        
+        return {
+            'short': stats_short,
+            'mid': stats_mid,
+            'long': stats_long
+        }
+    
+    def compute_guidance_scores(
+        self,
+        query: torch.Tensor,
+        training: bool = False
+    ) -> torch.Tensor:
+        """
+        Compute attention guidance scores from float tokens.
+        
+        This is the core AGFT operation. Instead of injecting K/V pairs, we compute
+        similarity scores between queries and stored float tokens, then use these
+        to create a guidance vector that modulates attention weights.
+        
+        Args:
+            query: Query tensor [B, S, num_heads, head_dim] for current frame
+            training: Whether in training mode (applies dropout if enabled)
+            
+        Returns:
+            guidance: Guidance scores [B, S, num_heads] for attention modulation
+        """
+        B, S, H, D = query.shape
+        
+        # Project queries for better compatibility with stored tokens
+        query_proj = self.query_proj(query)  # [B, S, H, D]
+        
+        # Get float tokens from all banks
+        k_short, _ = self.bank_short.get_kv()  # [K_short, H, D]
+        k_mid, _ = self.bank_mid.get_kv()      # [K_mid, H, D]
+        k_long, _ = self.bank_long.get_kv()    # [K_long, H, D]
+        
+        # Compute guidance for each temporal scale
+        guidance_list = []
+        
+        for bank_idx, (k_bank, weight) in enumerate(zip(
+            [k_short, k_mid, k_long],
+            self.temporal_weights
+        )):
+            if k_bank.shape[0] == 0:
+                # No tokens in this bank yet
+                guidance_list.append(torch.zeros(B, S, H, device=query.device, dtype=query.dtype))
+                continue
+            
+            # Expand bank tokens to match batch and query dimensions
+            # k_bank: [K, H, D] -> [B, H, K, D]
+            k_expanded = k_bank.unsqueeze(0).expand(B, -1, -1, -1).transpose(1, 2)
+            
+            # query_proj: [B, S, H, D] -> [B, H, S, D]
+            q_expanded = query_proj.transpose(1, 2)
+            
+            # Compute similarity: [B, H, S, K]
+            scale = D ** -0.5
+            similarity = torch.matmul(q_expanded, k_expanded.transpose(-2, -1)) * scale
+            
+            # Aggregate across tokens (max pooling for sharp selection)
+            guidance_scale, _ = similarity.max(dim=-1)  # [B, H, S]
+            guidance_scale = guidance_scale.transpose(1, 2)  # [B, S, H]
+            
+            # Apply temporal weight
+            guidance_list.append(guidance_scale * weight)
+        
+        # Aggregate across temporal scales
+        guidance = torch.stack(guidance_list, dim=-1).sum(dim=-1)  # [B, S, H]
+        
+        # Normalize to [0, 1] range using sigmoid
+        guidance = torch.sigmoid(guidance)
+        
+        # Apply dropout during training for robustness
+        if training and self.use_guidance_dropout and self.guidance_dropout_p > 0:
+            guidance = F.dropout(guidance, p=self.guidance_dropout_p, training=True)
+        
+        return guidance
+    
+    def modulate_attention_weights(
+        self,
+        attention_logits: torch.Tensor,
+        query: torch.Tensor,
+        training: bool = False
+    ) -> torch.Tensor:
+        """
+        Modulate attention logits using float token guidance.
+        
+        The modulation is multiplicative on the attention probabilities (post-softmax)
+        rather than additive on logits, to preserve the causal structure.
+        
+        Args:
+            attention_logits: Pre-softmax attention logits [B, H, S, T]
+            query: Query tensor [B, S, H, D] for computing guidance
+            training: Whether in training mode
+            
+        Returns:
+            modulated_logits: Guided attention logits
+        """
+        # Compute guidance scores [B, S, H]
+        guidance = self.compute_guidance_scores(query, training=training)
+        
+        # Expand guidance to match attention shape [B, H, S, 1]
+        guidance_expanded = guidance.transpose(1, 2).unsqueeze(-1)
+        
+        # Modulate attention logits additively
+        # The guidance boosts attention to positions that align with historical patterns
+        # We add a bias proportional to the guidance score
+        modulation = self.guidance_alpha * guidance_expanded
+        
+        # Apply modulation to the diagonal (self-attention within frame)
+        # This encourages the frame to attend to positions consistent with history
+        modulated_logits = attention_logits + modulation
+        
+        return modulated_logits
+    
+    def is_ready(self) -> bool:
+        """Check if at least one bank has been initialized."""
+        return (self.bank_short.initialized.item() or 
+                self.bank_mid.initialized.item() or 
+                self.bank_long.initialized.item())
+    
+    def get_stats(self) -> Dict[str, any]:
+        """Get statistics from all banks."""
+        return {
+            'short': self.bank_short.get_stats() if hasattr(self.bank_short, 'get_stats') else {},
+            'mid': self.bank_mid.get_stats() if hasattr(self.bank_mid, 'get_stats') else {},
+            'long': self.bank_long.get_stats() if hasattr(self.bank_long, 'get_stats') else {},
+            'guidance_alpha': self.guidance_alpha,
+            'temporal_weights': self.temporal_weights.tolist()
+        }
+
+
+def create_agft_config(
+    guidance_alpha: float = 0.1,
+    temporal_weights: List[float] = None,
+    num_slots_short: int = 4,
+    num_slots_mid: int = 4,
+    num_slots_long: int = 4,
+    use_guidance_dropout: bool = True,
+    guidance_dropout_p: float = 0.1
+) -> dict:
+    """
+    Create configuration for Attention-Guided Float Tokens.
+
+    Args:
+        guidance_alpha: Strength of attention modulation (0.05-0.2 recommended)
+        temporal_weights: Weights for short/mid/long guidance
+        num_slots_short/mid/long: Number of slots per bank
+        use_guidance_dropout: Enable dropout during training
+        guidance_dropout_p: Dropout probability
+
+    Returns:
+        Configuration dict for model_kwargs
+    """
+    if temporal_weights is None:
+        temporal_weights = [0.5, 0.3, 0.2]
+
+    return {
+        "use_float_tokens": True,
+        "use_kv_bank_v2": False,  # AGFT replaces V2
+        "use_attention_guided_float_tokens": True,
+        "agft_guidance_alpha": guidance_alpha,
+        "agft_temporal_weights": temporal_weights,
+        "agft_num_slots_short": num_slots_short,
+        "agft_num_slots_mid": num_slots_mid,
+        "agft_num_slots_long": num_slots_long,
+        "agft_use_guidance_dropout": use_guidance_dropout,
+        "agft_guidance_dropout_p": guidance_dropout_p,
+        "agft_update_interval_short": 1,
+        "agft_update_interval_mid": 10,
+        "agft_update_interval_long": 30,
+    }
+
+
+# =============================================================================
+# 960-Frame Video Generation Enhancements
+# =============================================================================
+
+class PositionAdaptiveGuidance:
+    """
+    Adjusts guidance strength based on position in sequence for 960-frame videos.
+
+    Schedule:
+    - Frames 0-200: alpha = 0.03 (minimal guidance, scene establishment)
+    - Frames 200-500: alpha = 0.08 (moderate guidance, scene development)
+    - Frames 500-800: alpha = 0.12 (stronger guidance, stability)
+    - Frames 800+: alpha = 0.15 (maximum guidance, prevent late drift)
+
+    Uses smooth transitions between phases.
+    """
+
+    def __init__(self, base_alpha=0.1, max_frames=960):
+        self.base_alpha = base_alpha
+        self.max_frames = max_frames
+        self.frame_count = 0
+
+    def get_guidance_alpha(self, current_frame=None):
+        """Get adaptive guidance alpha based on frame position."""
+        if current_frame is None:
+            current_frame = self.frame_count
+
+        # Smooth piecewise linear with transitions
+        progress = current_frame / self.max_frames
+
+        if progress < 0.2:
+            # Phase 1: Scene establishment (0-20%)
+            return 0.03 + (0.05 * progress / 0.2)
+        elif progress < 0.5:
+            # Phase 2: Scene development (20-50%)
+            return 0.08 + (0.04 * (progress - 0.2) / 0.3)
+        elif progress < 0.8:
+            # Phase 3: Stability (50-80%)
+            return 0.12 + (0.03 * (progress - 0.5) / 0.3)
+        else:
+            # Phase 4: Late sequence (80-100%)
+            return 0.15
+
+    def step(self, num_frames=1):
+        """Advance frame counter."""
+        self.frame_count += num_frames
+
+    def reset(self):
+        """Reset frame counter."""
+        self.frame_count = 0
+
+    def get_progress(self) -> float:
+        """Get current progress as ratio [0, 1]."""
+        return min(1.0, self.frame_count / self.max_frames)
+
+
+class SceneChangeDetector:
+    """
+    Detects scene transitions based on KV cache statistics.
+
+    Detection criteria:
+    1. Sudden change in average KV norm (>50% increase or <30% decrease)
+    2. High variance in token norms within a frame (indicating mixed content)
+    3. Coherence score dropping below threshold
+
+    On detection: Reset appropriate float banks (short/mid only, preserve long)
+    """
+
+    def __init__(self,
+                 norm_change_threshold=0.5,
+                 coherence_drop_threshold=0.3,
+                 history_size=10):
+        self.norm_change_threshold = norm_change_threshold
+        self.coherence_drop_threshold = coherence_drop_threshold
+        self.history_size = history_size
+
+        self.kv_norm_history = deque(maxlen=history_size)
+        self.coherence_history = deque(maxlen=history_size)
+        self.last_reset_frame = 0
+        self.reset_cooldown = 30  # Minimum frames between resets
+
+    def detect(self, current_kv_norm, coherence_score, current_frame):
+        """
+        Detect scene change.
+
+        Returns:
+            (scene_changed: bool, confidence: float)
+        """
+        self.kv_norm_history.append(current_kv_norm)
+        self.coherence_history.append(coherence_score)
+
+        # Cooldown period
+        if current_frame - self.last_reset_frame < self.reset_cooldown:
+            return False, 0.0
+
+        if len(self.kv_norm_history) < 3:
+            return False, 0.0
+
+        # Check for norm spike/drop
+        recent_norms = list(self.kv_norm_history)[-3:]
+        avg_recent = sum(recent_norms[:-1]) / len(recent_norms[:-1])
+        current = recent_norms[-1]
+
+        norm_change = abs(current - avg_recent) / (avg_recent + 1e-6)
+        norm_changed = norm_change > self.norm_change_threshold
+
+        # Check for coherence drop
+        if len(self.coherence_history) >= 3:
+            recent_coherence = list(self.coherence_history)[-3:]
+            avg_coherence = sum(recent_coherence[:-1]) / len(recent_coherence[:-1])
+            coherence_drop = avg_coherence - recent_coherence[-1]
+            coherence_changed = coherence_drop > self.coherence_drop_threshold
+        else:
+            coherence_changed = False
+            coherence_drop = 0.0
+
+        # Combined detection
+        if norm_changed and coherence_changed:
+            confidence = min(1.0, (norm_change + coherence_drop) / 2)
+            self.last_reset_frame = current_frame
+            return True, confidence
+        elif norm_changed and len(self.kv_norm_history) >= 5:
+            # Secondary check: sustained norm change
+            older_avg = sum(list(self.kv_norm_history)[:-3]) / (len(self.kv_norm_history) - 3)
+            if abs(current - older_avg) / (older_avg + 1e-6) > self.norm_change_threshold * 0.7:
+                self.last_reset_frame = current_frame
+                return True, norm_change
+
+        return False, 0.0
+
+    def reset(self):
+        """Reset detector state."""
+        self.kv_norm_history.clear()
+        self.coherence_history.clear()
+        self.last_reset_frame = 0
+
+
+class ExtendedTemporalCoherenceScorer(TemporalCoherenceScorer):
+    """
+    Extended version with ultra-long window for 960-frame sequences.
+
+    Windows:
+    - Short: 3 frames (flicker detection)
+    - Mid: 10 frames (local consistency)
+    - Long: 30 frames (scene consistency)
+    - Ultra: 100 frames (long-term drift detection)
+
+    Additional: Trend analysis to detect gradual degradation.
+    """
+
+    def __init__(self, d_model, history_size=100):
+        super().__init__(d_model, history_size)
+        self.trend_buffer = deque(maxlen=20)  # For trend analysis
+        self.degradation_counter = 0
+
+    def compute_coherence_extended(self, current_frame):
+        """
+        Compute extended coherence with ultra-long window.
+
+        Returns:
+            (scores: [short, mid, long, ultra], overall, trend)
+        """
+        # Get base scores from parent (short, mid, long)
+        base_scores, base_overall = super().compute_coherence(current_frame)
+
+        # Compute ultra-long coherence (100 frames)
+        if self.history_count >= 50:
+            ultra_window = self._get_recent_frames(100)
+            current_vec = current_frame.mean(dim=0) if current_frame.dim() == 2 else current_frame
+            ultra_sim = F.cosine_similarity(
+                current_vec.unsqueeze(0),
+                ultra_window.mean(dim=0, keepdim=True),
+                dim=-1
+            ).mean()
+        else:
+            ultra_sim = torch.tensor(1.0, device=current_frame.device)
+
+        # Stack all scores
+        scores = torch.cat([base_scores, ultra_sim.unsqueeze(0)])
+
+        # Compute trend (are we degrading over time?)
+        self.trend_buffer.append(base_overall)
+        trend = 0.0
+        if len(self.trend_buffer) >= 10:
+            recent = sum(list(self.trend_buffer)[-5:]) / 5
+            older = sum(list(self.trend_buffer)[:5]) / 5
+            trend = recent - older  # Negative = degrading
+
+            # Track sustained degradation
+            if trend < -0.05:
+                self.degradation_counter += 1
+            else:
+                self.degradation_counter = max(0, self.degradation_counter - 1)
+
+        # Adjust overall score based on trend and degradation
+        adjusted_overall = base_overall
+        if trend < -0.1:  # Significant degradation
+            adjusted_overall = base_overall * 0.9
+        if self.degradation_counter > 10:  # Sustained degradation
+            adjusted_overall = adjusted_overall * 0.85
+
+        return scores, adjusted_overall, trend
+
+
+class EnhancedAttentionGuidedFloatBank(AttentionGuidedFloatBank):
+    """
+    Enhanced AGFT with position-adaptive guidance and scene change detection.
+    Designed specifically for 960-frame video generation.
+    """
+
+    def __init__(self, *args,
+                 use_position_adaptive=True,
+                 use_scene_detection=True,
+                 use_extended_coherence=True,
+                 max_frames=960,
+                 **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.use_position_adaptive = use_position_adaptive
+        self.use_scene_detection = use_scene_detection
+        self.use_extended_coherence = use_extended_coherence
+        self.max_frames = max_frames
+
+        if use_position_adaptive:
+            self.position_guidance = PositionAdaptiveGuidance(
+                base_alpha=self.guidance_alpha,
+                max_frames=max_frames
+            )
+
+        if use_scene_detection:
+            self.scene_detector = SceneChangeDetector()
+
+        if use_extended_coherence:
+            # Replace coherence scorer with extended version
+            self.coherence_scorer = ExtendedTemporalCoherenceScorer(
+                self.num_heads * self.head_dim,
+                history_size=100
+            )
+
+        self.frame_counter = 0
+        self.stats_history = []
+
+    def compute_guidance_scores(self, query, training=False, current_frame=None):
+        """
+        Compute guidance scores with position-adaptive alpha.
+        """
+        # Get base guidance from parent
+        guidance = super().compute_guidance_scores(query, training)
+
+        # Apply position-adaptive scaling
+        if self.use_position_adaptive and current_frame is not None:
+            adaptive_alpha = self.position_guidance.get_guidance_alpha(current_frame)
+            # Scale guidance by adaptive_alpha / base_alpha
+            if self.guidance_alpha > 0:
+                scale = adaptive_alpha / self.guidance_alpha
+                guidance = guidance * scale
+
+        return guidance
+
+    def modulate_attention_weights(self, attention_logits, query, training=False, current_frame=None):
+        """
+        Modulate attention with position-adaptive guidance.
+        """
+        # Compute guidance with position adaptation
+        guidance = self.compute_guidance_scores(query, training, current_frame)
+
+        # Expand guidance to match attention shape [B, H, S, 1]
+        guidance_expanded = guidance.transpose(1, 2).unsqueeze(-1)
+
+        # Get adaptive alpha
+        if self.use_position_adaptive and current_frame is not None:
+            alpha = self.position_guidance.get_guidance_alpha(current_frame)
+        else:
+            alpha = self.guidance_alpha
+
+        # Apply modulation
+        modulation = alpha * guidance_expanded
+        modulated_logits = attention_logits + modulation
+
+        return modulated_logits
+
+    def update(self, evicted_k, evicted_v, frame_hidden=None,
+               current_frame=None, kv_norm=None):
+        """
+        Update with scene change detection.
+        """
+        # Update frame counter
+        if current_frame is not None:
+            self.frame_counter = current_frame
+        else:
+            current_frame = self.frame_counter
+            self.frame_counter += 1
+
+        # Check for scene change
+        scene_changed = False
+        confidence = 0.0
+        if self.use_scene_detection and kv_norm is not None:
+            # Get coherence if available
+            coherence = 1.0
+            if self.coherence_scorer is not None and frame_hidden is not None:
+                if self.use_extended_coherence:
+                    _, coherence, _ = self.coherence_scorer.compute_coherence_extended(frame_hidden)
+                else:
+                    _, coherence = self.coherence_scorer.compute_coherence(frame_hidden)
+
+            scene_changed, confidence = self.scene_detector.detect(
+                kv_norm, coherence, current_frame
+            )
+
+            if scene_changed and confidence > 0.6:
+                # Reset short and mid banks, preserve long for context
+                self.bank_short.reset()
+                self.bank_mid.reset()
+                print(f"[SceneChange] Detected at frame {current_frame} (confidence: {confidence:.2f})")
+
+        # Normal update
+        stats = super().update(evicted_k, evicted_v, frame_hidden)
+
+        # Add scene detection info to stats
+        stats['scene_changed'] = scene_changed
+        stats['scene_confidence'] = confidence
+        stats['frame'] = current_frame
+
+        # Update position counter
+        if self.use_position_adaptive:
+            self.position_guidance.frame_count = current_frame
+
+        self.stats_history.append(stats)
+        return stats
+
+    def reset(self):
+        """Reset all components."""
+        super().reset()
+        if self.use_position_adaptive:
+            self.position_guidance.reset()
+        if self.use_scene_detection:
+            self.scene_detector.reset()
+        self.frame_counter = 0
+        self.stats_history.clear()
+
+    def get_detailed_stats(self):
+        """Get comprehensive statistics."""
+        base_stats = self.get_stats()
+        base_stats['frame_counter'] = self.frame_counter
+        base_stats['progress'] = self.frame_counter / self.max_frames if self.max_frames > 0 else 0
+
+        if self.use_position_adaptive:
+            base_stats['current_alpha'] = self.position_guidance.get_guidance_alpha()
+
+        if self.stats_history:
+            recent_scenes = [s for s in self.stats_history[-50:] if s.get('scene_changed')]
+            base_stats['recent_scene_changes'] = len(recent_scenes)
+
+        return base_stats
+
+
+def create_960_frame_config(
+    guidance_alpha: float = 0.1,
+    temporal_weights: List[float] = None,
+    num_slots_short: int = 4,
+    num_slots_mid: int = 4,
+    num_slots_long: int = 4,
+    use_position_adaptive: bool = True,
+    use_scene_detection: bool = True,
+    use_extended_coherence: bool = True,
+) -> dict:
+    """
+    Create optimized configuration for 960-frame video generation.
+
+    Args:
+        guidance_alpha: Base guidance strength
+        temporal_weights: Weights for short/mid/long guidance
+        num_slots_short/mid/long: Number of slots per bank
+        use_position_adaptive: Enable position-adaptive guidance
+        use_scene_detection: Enable scene change detection
+        use_extended_coherence: Enable extended coherence scoring
+
+    Returns:
+        Configuration dict for model_kwargs
+    """
+    if temporal_weights is None:
+        temporal_weights = [0.5, 0.3, 0.2]
+
+    return {
+        "use_float_tokens": True,
+        "use_kv_bank_v2": False,
+        "use_attention_guided_float_tokens": True,
+        "use_enhanced_agft": True,
+        "agft_guidance_alpha": guidance_alpha,
+        "agft_temporal_weights": temporal_weights,
+        "agft_num_slots_short": num_slots_short,
+        "agft_num_slots_mid": num_slots_mid,
+        "agft_num_slots_long": num_slots_long,
+        "agft_update_interval_short": 1,
+        "agft_update_interval_mid": 10,
+        "agft_update_interval_long": 30,
+        "agft_use_position_adaptive": use_position_adaptive,
+        "agft_use_scene_detection": use_scene_detection,
+        "agft_use_extended_coherence": use_extended_coherence,
+        "agft_max_frames": 960,
+    }
