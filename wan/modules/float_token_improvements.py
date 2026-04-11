@@ -698,6 +698,23 @@ class FloatKVSlot(nn.Module):
         ev = evicted_v.mean(dim=0)  # [N, H, D]
         
         with torch.no_grad():
+            # Eviction Quality Gate: reject frames with anomalous KV norms
+            # (too low = collapsed/blank frames, too high = unstable/noise frames)
+            ek_norm = ek.norm(dim=-1).mean().item()  # Average norm per token
+            if self.initialized:
+                # Reference scale: use current slot norms as expected range
+                slot_norm = self.slots_k.norm(dim=-1).mean().item()
+                if slot_norm > 0:
+                    norm_ratio = ek_norm / (slot_norm + 1e-6)
+                    # Reject if norm is too extreme (< 0.1x or > 10x reference)
+                    if norm_ratio < 0.1 or norm_ratio > 10.0:
+                        return {
+                            'updated': False,
+                            'rejected': True,
+                            'norm_ratio': norm_ratio,
+                            'slot_k_norms': self.slots_k.norm(dim=-1).mean(dim=-1).detach()
+                        }
+
             # 首次初始化：将evicted tokens分块成num_slots组
             if not self.initialized:
                 N = ek.shape[0]
