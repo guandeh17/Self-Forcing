@@ -809,12 +809,20 @@ class FloatKVSlot(nn.Module):
     
     def get_kv(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        获取当前所有slot的K/V对
-        
+        获取已写入slot的K/V对 (只返回已初始化的slot，过滤零值)
+
         Returns:
-            slots_k: [num_slots, num_heads, head_dim]
-            slots_v: [num_slots, num_heads, head_dim]
+            slots_k: [num_written_slots, num_heads, head_dim]
+            slots_v: [num_written_slots, num_heads, head_dim]
         """
+        if self.use_fifo_slots and hasattr(self, 'slot_written'):
+            # Only return slots that have been written to at least once
+            written_mask = self.slot_written  # [num_slots] bool
+            if written_mask.any():
+                return self.slots_k[written_mask], self.slots_v[written_mask]
+            else:
+                # No slots written yet - return empty (caller should check is_ready())
+                return self.slots_k[:0], self.slots_v[:0]
         return self.slots_k, self.slots_v
 
 
