@@ -684,8 +684,12 @@ class FloatKVSlot(nn.Module):
         Returns:
             stats: 更新统计信息
         """
+        # Guard: if num_slots=0, this bank is disabled
+        if self.num_slots == 0:
+            return {'updated': False, 'disabled': True}
+
         self.update_count += 1
-        
+
         # 检查更新间隔
         if self.update_count % self.update_interval != 0:
             return {
@@ -950,9 +954,16 @@ class HierarchicalFloatKVBank(nn.Module):
         return float_k, float_v
 
     def is_ready(self) -> bool:
-        '''Returns True if float bank has been initialized with at least one eviction.
+        '''Returns True if at least one bank has been initialized with at least one eviction.
         Used to guard against injecting zero-initialized float tokens.'''
-        return bool(self.bank_short.initialized.item())
+        # Check which banks are active (num_slots > 0)
+        if self.bank_short.num_slots > 0:
+            return bool(self.bank_short.initialized.item())
+        elif self.bank_mid.num_slots > 0:
+            return bool(self.bank_mid.initialized.item())
+        elif self.bank_long.num_slots > 0:
+            return bool(self.bank_long.initialized.item())
+        return False  # All banks disabled
 
 
 # 便捷函数

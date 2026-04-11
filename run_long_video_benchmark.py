@@ -137,6 +137,26 @@ def create_config(mode: str):
         print("  - Float tokens: ENABLED (V2)")
         print("  - Attention sink: ENABLED (sink_size=1, keeps first frame)")
         print("=" * 80)
+    elif mode == "float_v2_shortonly":
+        # Float KV Bank V2 with ONLY the short-term bank active (no mid/long)
+        # Key finding: fewer active slots = better subject consistency
+        model_kwargs = {
+            "timestep_shift": 5.0,
+            "local_attn_size": 21,
+            "use_float_tokens": True,
+            "use_kv_bank_v2": True,
+            "use_hierarchical_float_tokens": True,
+            "float_token_num_slots_short": 4,
+            "float_token_num_slots_mid": 0,   # Disable mid-term bank
+            "float_token_num_slots_long": 0,  # Disable long-term bank
+            "float_token_update_interval_short": 1,
+        }
+        print("=" * 80)
+        print("Mode: FLOAT_V2_SHORTONLY (Short-term bank only, 4 slots)")
+        print("  - Local attention: ENABLED (local_attn_size=21)")
+        print("  - Float tokens: ENABLED (V2, short-term only)")
+        print("  - 4 slots, update every eviction")
+        print("=" * 80)
     elif mode == "float_v2_midlayers":
         # Float KV Bank V2 only in middle transformer layers (10-20 of 30)
         model_kwargs = {
@@ -171,8 +191,8 @@ def main():
         "--mode",
         type=str,
         required=True,
-        choices=["baseline", "float_v2", "float_v2_sink", "float_v2_midlayers"],
-        help="Inference mode: 'baseline', 'float_v2', 'float_v2_sink' (V2 + attention sink), or 'float_v2_midlayers' (V2, mid-layers only)"
+        choices=["baseline", "float_v2", "float_v2_sink", "float_v2_midlayers", "float_v2_shortonly"],
+        help="Inference mode: baseline, float_v2, float_v2_sink, float_v2_midlayers, or float_v2_shortonly"
     )
     parser.add_argument(
         "--output_dir",
