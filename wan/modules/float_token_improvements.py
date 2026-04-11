@@ -606,6 +606,8 @@ class FloatKVSlot(nn.Module):
         self.register_buffer('update_count', torch.tensor(0, dtype=torch.long))
         # FIFO slot pointer: which slot to write next (for temporal diversity)
         self.register_buffer('slot_write_ptr', torch.tensor(0, dtype=torch.long))
+        # Track which slots have been written at least once (for first-write direct assignment)
+        self.register_buffer('slot_written', torch.zeros(num_slots, dtype=torch.bool))
         
         # Content-Adaptive Alpha: 存储前一次的evicted_k平均值
         self.register_buffer('prev_evicted_k_avg', torch.zeros(num_heads, head_dim))
@@ -620,6 +622,7 @@ class FloatKVSlot(nn.Module):
         self.prev_evicted_k_avg.zero_()
         self.has_prev.fill_(False)
         self.slot_write_ptr.zero_()
+        self.slot_written.fill_(False)
     
     def _compute_adaptive_alpha(self, evicted_k: torch.Tensor) -> float:
         """
@@ -764,8 +767,15 @@ class FloatKVSlot(nn.Module):
                 # This ensures each slot holds a DIFFERENT temporal snapshot
                 # (temporal diversity), rather than all slots chasing the same eviction
                 slot_idx = self.slot_write_ptr.item() % self.num_slots
-                self.slots_k[slot_idx].mul_(1 - eff_alpha).add_(new_k_raw[0], alpha=eff_alpha)
-                self.slots_v[slot_idx].mul_(1 - eff_alpha).add_(new_v_raw[0], alpha=eff_alpha)
+                if not self.slot_written[slot_idx]:
+                    # First write to this slot: direct assignment (no blending with zero init)
+                    self.slots_k[slot_idx].copy_(new_k_raw[0])
+                    self.slots_v[slot_idx].copy_(new_v_raw[0])
+                    self.slot_written[slot_idx] = True
+                else:
+                    # Subsequent writes: EMA blend (temporal smoothing within slot)
+                    self.slots_k[slot_idx].mul_(1 - eff_alpha).add_(new_k_raw[0], alpha=eff_alpha)
+                    self.slots_v[slot_idx].mul_(1 - eff_alpha).add_(new_v_raw[0], alpha=eff_alpha)
                 self.slot_write_ptr.add_(1)
             else:
                 # Slot Attention: each slot selects relevant evicted tokens via softmax
