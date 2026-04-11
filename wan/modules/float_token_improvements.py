@@ -602,6 +602,10 @@ class FloatKVSlot(nn.Module):
         # 状态标记
         self.register_buffer('initialized', torch.tensor(False, dtype=torch.bool))
         self.register_buffer('update_count', torch.tensor(0, dtype=torch.long))
+        
+        # Content-Adaptive Alpha: 存储前一次的evicted_k平均值
+        self.register_buffer('prev_evicted_k_avg', torch.zeros(num_heads, head_dim))
+        self.register_buffer('has_prev', torch.tensor(False, dtype=torch.bool))
     
     def reset(self):
         """重置states状态"""
@@ -609,6 +613,51 @@ class FloatKVSlot(nn.Module):
         self.slots_v.zero_()
         self.initialized.fill_(False)
         self.update_count.zero_()
+        self.prev_evicted_k_avg.zero_()
+        self.has_prev.fill_(False)
+    
+    def _compute_adaptive_alpha(self, evicted_k: torch.Tensor) -> float:
+        """
+        计算内容自适应的alpha值
+        
+        关键逻辑：当连续边缘化差异大时(低余弦相似度=场景变化)，使用高alpha快速捕捉新内容
+        当连续边缘化相似时(高余弦相似度=稳定场景)，使用低alpha平滑累积
+        
+        Args:
+            evicted_k: 被驱逐的key [N, num_heads, head_dim]
+            
+        Returns:
+            alpha_adaptive: 自适应alpha值
+        """
+        with torch.no_grad():
+            # 对tokens取平均 -> [num_heads, head_dim]
+            ek = evicted_k.mean(dim=0)  # [H, D]
+            
+            # 如果没有前一次的记录，存储当前值并返回基础alpha
+            if not self.has_prev:
+                self.prev_evicted_k_avg.copy_(ek)
+                self.has_prev.fill_(True)
+                return self.alpha
+            
+            # 计算余弦相似度: 对每个head计算后取平均
+            # cosine_similarity: [H, D] vs [H, D] -> [H]
+            cosine_sim = F.cosine_similarity(
+                ek, self.prev_evicted_k_avg, dim=-1, eps=self.eps
+            ).mean()  # 对heads取平均得到标量
+            
+            # 计算自适应alpha: 场景变化时增大，稳定时减小
+            # alpha_adaptive = alpha_base * (1 + 2 * (1 - cosine_sim))
+            alpha_adaptive = self.alpha * (1.0 + 2.0 * (1.0 - cosine_sim.item()))
+            
+            # 限制范围: [alpha_base * 0.5, min(alpha_base * 3, 0.9)]
+            alpha_min = self.alpha * 0.5
+            alpha_max = min(self.alpha * 3.0, 0.9)
+            alpha_adaptive = max(alpha_min, min(alpha_max, alpha_adaptive))
+            
+            # 更新prev_evicted_k_avg为滚动平均(alpha=0.5)
+            self.prev_evicted_k_avg.mul_(0.5).add_(ek, alpha=0.5)
+            
+            return alpha_adaptive
     
     def update(
         self,
@@ -693,8 +742,11 @@ class FloatKVSlot(nn.Module):
             new_k = torch.einsum('kn,nhd->khd', attn_weights, ek)
             new_v = torch.einsum('kn,nhd->khd', attn_weights, ev)
             
-            # 计算有效alpha（考虑quality_score）
-            eff_alpha = max(0.05, min(0.95, self.alpha * quality_score))
+            # 计算内容自适应alpha
+            adaptive_alpha = self._compute_adaptive_alpha(ek)
+            
+            # 结合质量分数计算有效alpha
+            eff_alpha = max(0.05, min(0.95, adaptive_alpha * quality_score))
             
             # EMA更新
             self.slots_k.mul_(1 - eff_alpha).add_(new_k, alpha=eff_alpha)
@@ -704,6 +756,7 @@ class FloatKVSlot(nn.Module):
             'updated': True,
             'initialized': True,
             'alpha': eff_alpha,
+            'adaptive_alpha': adaptive_alpha,
             'quality_score': quality_score,
             'slot_k_norms': self.slots_k.norm(dim=-1).mean(dim=-1).detach()
         }
@@ -831,7 +884,10 @@ class HierarchicalFloatKVBank(nn.Module):
             'short': stats_short,
             'mid': stats_mid,
             'long': stats_long,
-            'quality_score': quality_score
+            'quality_score': quality_score,
+            'adaptive_alpha_short': stats_short.get('adaptive_alpha', self.bank_short.alpha),
+            'adaptive_alpha_mid': stats_mid.get('adaptive_alpha', self.bank_mid.alpha),
+            'adaptive_alpha_long': stats_long.get('adaptive_alpha', self.bank_long.alpha)
         }
     
     def get_all_kv(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -850,6 +906,11 @@ class HierarchicalFloatKVBank(nn.Module):
         float_v = torch.cat([v_short, v_mid, v_long], dim=0)
         
         return float_k, float_v
+
+    def is_ready(self) -> bool:
+        '''Returns True if float bank has been initialized with at least one eviction.
+        Used to guard against injecting zero-initialized float tokens.'''
+        return bool(self.bank_short.initialized.item())
 
 
 # 便捷函数

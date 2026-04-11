@@ -132,6 +132,7 @@ class WanDiffusionWrapper(torch.nn.Module):
             float_token_update_interval_mid=30,
             float_token_update_interval_long=90,
             use_quality_scorer=True,
+            float_token_layer_range=(0, 30),  # Only enable float tokens for layers in [start, end)
             **kwargs  # Accept additional kwargs for compatibility
     ):
         super().__init__()
@@ -154,6 +155,8 @@ class WanDiffusionWrapper(torch.nn.Module):
                 print(f"  mid: {float_token_num_slots_mid} slots, alpha={float_token_alpha_mid}, interval={float_token_update_interval_mid}")
                 print(f"  long: {float_token_num_slots_long} slots, alpha={float_token_alpha_long}, interval={float_token_update_interval_long}")
                 print(f"  use_quality_scorer: {use_quality_scorer}")
+                layer_start, layer_end = float_token_layer_range
+                print(f"  float_token_layer_range: {float_token_layer_range} (layers {layer_start}-{layer_end-1})")
                 print("=" * 80)
 
                 # Reinitialize attention blocks with float tokens
@@ -170,6 +173,9 @@ class WanDiffusionWrapper(torch.nn.Module):
                     # Determine cross_attn_type from original block
                     cross_attn_type = 't2v_cross_attn' if 'T2V' in type(block.cross_attn).__name__ else 'i2v_cross_attn'
 
+                    # Enable float tokens only for layers within the specified range
+                    block_use_float_tokens = use_float_tokens and (layer_start <= i < layer_end)
+
                     new_block = CausalWanAttentionBlock(
                         cross_attn_type=cross_attn_type,
                         dim=block.dim,
@@ -181,7 +187,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                         cross_attn_norm=cross_attn_norm,
                         eps=eps,
                         # Float token configuration
-                        use_float_tokens=use_float_tokens,
+                        use_float_tokens=block_use_float_tokens,
                         use_hierarchical_float_tokens=use_hierarchical_float_tokens,
                         float_token_num_slots_short=float_token_num_slots_short,
                         float_token_num_slots_mid=float_token_num_slots_mid,

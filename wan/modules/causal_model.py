@@ -159,6 +159,13 @@ class CausalWanSelfAttention(nn.Module):
         else:
             self.float_kv_bank = None
 
+        # When V2 KV bank is active, disable V1 float bank to prevent it from injecting
+        # zero-initialized tokens as a fallback
+        if self.use_float_tokens and use_kv_bank_v2 and self.float_bank is not None:
+            # V2 bank takes priority; disable V1 to avoid zero-token injection fallback
+            self.float_bank = None
+            self.num_float_tokens = 0
+
         # layers
         self.q = nn.Linear(dim, dim)
         self.k = nn.Linear(dim, dim)
@@ -555,11 +562,17 @@ class CausalWanSelfAttention(nn.Module):
             cached_k = kv_cache["k"][:, kv_start:local_end_index]
             cached_v = kv_cache["v"][:, kv_start:local_end_index]
 
-            if self.use_float_tokens and self.float_kv_bank is not None:
+            if self.use_float_tokens and self.float_kv_bank is not None and self.float_kv_bank.is_ready():
                 # V2: Direct KV injection - no double-projection, no RoPE on float tokens
                 float_k, float_v = self.float_kv_bank.get_all_kv()  # [K, H, D]
                 float_k_batch = float_k.unsqueeze(0).expand(b, -1, -1, -1)  # [B, K, H, D]
                 float_v_batch = float_v.unsqueeze(0).expand(b, -1, -1, -1)  # [B, K, H, D]
+                # Scale normalization: match float token scale to cached token scale
+                # This prevents float tokens from dominating attention due to magnitude differences
+                cached_k_scale = cached_k.norm(dim=-1, keepdim=True).mean() + 1e-6
+                float_k_scale = float_k_batch.norm(dim=-1, keepdim=True).mean() + 1e-6
+                scale_ratio = (cached_k_scale / float_k_scale).clamp(0.1, 10.0)
+                float_k_batch = float_k_batch * scale_ratio
                 # Float tokens are position-agnostic: no RoPE applied
                 full_k = torch.cat([float_k_batch.type_as(cached_k), cached_k], dim=1)
                 full_v = torch.cat([float_v_batch.type_as(cached_v), cached_v], dim=1)
