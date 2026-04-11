@@ -133,6 +133,7 @@ class WanDiffusionWrapper(torch.nn.Module):
             float_token_update_interval_long=90,
             use_quality_scorer=True,
             float_token_layer_range=(0, 30),  # Only enable float tokens for layers in [start, end)
+            use_kv_bank_v2=True,  # Use Float KV Bank V2 (direct KV storage, no double-projection)
             **kwargs  # Accept additional kwargs for compatibility
     ):
         super().__init__()
@@ -199,6 +200,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                         float_token_update_interval_mid=float_token_update_interval_mid,
                         float_token_update_interval_long=float_token_update_interval_long,
                         use_quality_scorer=use_quality_scorer,
+                        use_kv_bank_v2=use_kv_bank_v2,
                     )
 
                     # Copy weights from old block
