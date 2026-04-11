@@ -585,7 +585,8 @@ class FloatKVSlot(nn.Module):
         head_dim: int = 128,
         alpha: float = 0.2,
         update_interval: int = 1,
-        eps: float = 1e-6
+        eps: float = 1e-6,
+        use_fifo_slots: bool = True,  # FIFO slot assignment for temporal diversity
     ):
         super().__init__()
         self.num_slots = num_slots
@@ -594,14 +595,17 @@ class FloatKVSlot(nn.Module):
         self.alpha = alpha
         self.update_interval = update_interval
         self.eps = eps
-        
+        self.use_fifo_slots = use_fifo_slots
+
         # 直接存储K/V对 - shape: [num_slots, num_heads, head_dim]
         self.register_buffer('slots_k', torch.zeros(num_slots, num_heads, head_dim))
         self.register_buffer('slots_v', torch.zeros(num_slots, num_heads, head_dim))
-        
+
         # 状态标记
         self.register_buffer('initialized', torch.tensor(False, dtype=torch.bool))
         self.register_buffer('update_count', torch.tensor(0, dtype=torch.long))
+        # FIFO slot pointer: which slot to write next (for temporal diversity)
+        self.register_buffer('slot_write_ptr', torch.tensor(0, dtype=torch.long))
         
         # Content-Adaptive Alpha: 存储前一次的evicted_k平均值
         self.register_buffer('prev_evicted_k_avg', torch.zeros(num_heads, head_dim))
@@ -615,6 +619,7 @@ class FloatKVSlot(nn.Module):
         self.update_count.zero_()
         self.prev_evicted_k_avg.zero_()
         self.has_prev.fill_(False)
+        self.slot_write_ptr.zero_()
     
     def _compute_adaptive_alpha(self, evicted_k: torch.Tensor) -> float:
         """
@@ -743,31 +748,41 @@ class FloatKVSlot(nn.Module):
                     'slot_k_norms': self.slots_k.norm(dim=-1).mean(dim=-1).detach()
                 }
             
-            # Slot Attention: 在head维度上平均后计算attention
-            # slots_k: [K, H, D] -> avg over heads -> [K, D]
-            # ek: [N, H, D] -> avg over heads -> [N, D]
-            slots_k_avg = self.slots_k.mean(dim=1)  # [K, D]
-            ek_avg = ek.mean(dim=1)  # [N, D]
-            ev_avg = ev.mean(dim=1)  # [N, D]
-            
-            # 计算attention logits: [K, N]
-            attn_logits = torch.einsum('kd,nd->kn', slots_k_avg, ek_avg) * (self.head_dim ** -0.5)
-            attn_weights = F.softmax(attn_logits, dim=-1)  # [K, N] - 每个slot对所有evicted tokens的权重
-            
-            # 计算新的K/V: 用attention weights加权求和
-            # [K, N] @ [N, H, D] -> [K, H, D]
-            new_k = torch.einsum('kn,nhd->khd', attn_weights, ek)
-            new_v = torch.einsum('kn,nhd->khd', attn_weights, ev)
-            
+            # Compute the new KV representation from evicted tokens
+            # Average eviction over tokens for each head
+            new_k_raw = ek.mean(dim=0, keepdim=True)  # [1, H, D]
+            new_v_raw = ev.mean(dim=0, keepdim=True)  # [1, H, D]
+
             # 计算内容自适应alpha
             adaptive_alpha = self._compute_adaptive_alpha(ek)
-            
+
             # 结合质量分数计算有效alpha
             eff_alpha = max(0.05, min(0.95, adaptive_alpha * quality_score))
-            
-            # EMA更新
-            self.slots_k.mul_(1 - eff_alpha).add_(new_k, alpha=eff_alpha)
-            self.slots_v.mul_(1 - eff_alpha).add_(new_v, alpha=eff_alpha)
+
+            if self.use_fifo_slots:
+                # FIFO slot assignment: write to next slot in ring buffer
+                # This ensures each slot holds a DIFFERENT temporal snapshot
+                # (temporal diversity), rather than all slots chasing the same eviction
+                slot_idx = self.slot_write_ptr.item() % self.num_slots
+                self.slots_k[slot_idx].mul_(1 - eff_alpha).add_(new_k_raw[0], alpha=eff_alpha)
+                self.slots_v[slot_idx].mul_(1 - eff_alpha).add_(new_v_raw[0], alpha=eff_alpha)
+                self.slot_write_ptr.add_(1)
+            else:
+                # Slot Attention: each slot selects relevant evicted tokens via softmax
+                slots_k_avg = self.slots_k.mean(dim=1)  # [K, D]
+                ek_avg = ek.mean(dim=1)  # [N, D]
+
+                # 计算attention logits: [K, N]
+                attn_logits = torch.einsum('kd,nd->kn', slots_k_avg, ek_avg) * (self.head_dim ** -0.5)
+                attn_weights = F.softmax(attn_logits, dim=-1)  # [K, N]
+
+                # 计算新的K/V: 用attention weights加权求和
+                new_k = torch.einsum('kn,nhd->khd', attn_weights, ek)
+                new_v = torch.einsum('kn,nhd->khd', attn_weights, ev)
+
+                # EMA更新 (all slots updated)
+                self.slots_k.mul_(1 - eff_alpha).add_(new_k, alpha=eff_alpha)
+                self.slots_v.mul_(1 - eff_alpha).add_(new_v, alpha=eff_alpha)
         
         return {
             'updated': True,
