@@ -23,6 +23,8 @@ try:
     from wan.modules.float_token_improvements import (
         HierarchicalFloatBank,
         FloatTokenBank,
+        HierarchicalFloatKVBank,
+        FloatKVSlot,
         FrameQualityScorer,
         apply_rope_with_float_tokens,
         causal_rope_apply_with_float_tokens
@@ -89,7 +91,8 @@ class CausalWanSelfAttention(nn.Module):
                  float_token_update_interval_short=1,
                  float_token_update_interval_mid=30,
                  float_token_update_interval_long=90,
-                 use_quality_scorer=True):
+                 use_quality_scorer=True,
+                 use_kv_bank_v2=True):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
@@ -136,6 +139,26 @@ class CausalWanSelfAttention(nn.Module):
             self.float_bank = None
             self.num_float_tokens = 0
 
+        # Float KV Bank V2 (improved - direct KV storage, no double-projection)
+        self.use_kv_bank_v2 = use_kv_bank_v2
+        if self.use_float_tokens and use_kv_bank_v2:
+            self.float_kv_bank = HierarchicalFloatKVBank(
+                num_heads=num_heads,
+                head_dim=self.head_dim,
+                num_slots_short=float_token_num_slots_short,
+                num_slots_mid=float_token_num_slots_mid,
+                num_slots_long=float_token_num_slots_long,
+                alpha_short=float_token_alpha_short,
+                alpha_mid=float_token_alpha_mid,
+                alpha_long=float_token_alpha_long,
+                update_interval_short=float_token_update_interval_short,
+                update_interval_mid=float_token_update_interval_mid,
+                update_interval_long=float_token_update_interval_long,
+                use_quality_scorer=use_quality_scorer
+            )
+        else:
+            self.float_kv_bank = None
+
         # layers
         self.q = nn.Linear(dim, dim)
         self.k = nn.Linear(dim, dim)
@@ -148,6 +171,8 @@ class CausalWanSelfAttention(nn.Module):
         """重置 float bank 状态，用于新序列开始时"""
         if self.float_bank is not None:
             self.float_bank.reset()
+        if self.float_kv_bank is not None:
+            self.float_kv_bank.reset()
 
     def _update_float_bank_from_evicted_kv(
         self,
@@ -491,6 +516,12 @@ class CausalWanSelfAttention(nn.Module):
                         # Update float bank
                         self._update_float_bank_from_evicted_kv(evicted_k, evicted_v, x)
 
+                    # Update Float KV Bank V2 from evicted tokens
+                    if self.use_float_tokens and self.float_kv_bank is not None and num_evicted_tokens > 0:
+                        evicted_k_v2 = kv_cache["k"][:, sink_tokens + num_rolled_tokens:sink_tokens + num_rolled_tokens + num_evicted_tokens].clone()
+                        evicted_v_v2 = kv_cache["v"][:, sink_tokens + num_rolled_tokens:sink_tokens + num_rolled_tokens + num_evicted_tokens].clone()
+                        self.float_kv_bank.update(evicted_k_v2, evicted_v_v2, x)
+
                     kv_cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                         kv_cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
                     kv_cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
@@ -519,42 +550,36 @@ class CausalWanSelfAttention(nn.Module):
                 kv_cache["k"][:, local_start_index:local_end_index] = roped_key
                 kv_cache["v"][:, local_start_index:local_end_index] = v
 
-            # Attention - dynamically concatenate float tokens if enabled
-            if self.use_float_tokens and self.float_bank is not None:
-                # Get float tokens from bank
-                float_tokens = self.float_bank.get_all_tokens()  # [num_float_tokens, dim]
+            # Attention - inject float KV tokens for long-range consistency
+            kv_start = max(0, local_end_index - self.max_attention_size)
+            cached_k = kv_cache["k"][:, kv_start:local_end_index]
+            cached_v = kv_cache["v"][:, kv_start:local_end_index]
+
+            if self.use_float_tokens and self.float_kv_bank is not None:
+                # V2: Direct KV injection - no double-projection, no RoPE on float tokens
+                float_k, float_v = self.float_kv_bank.get_all_kv()  # [K, H, D]
+                float_k_batch = float_k.unsqueeze(0).expand(b, -1, -1, -1)  # [B, K, H, D]
+                float_v_batch = float_v.unsqueeze(0).expand(b, -1, -1, -1)  # [B, K, H, D]
+                # Float tokens are position-agnostic: no RoPE applied
+                full_k = torch.cat([float_k_batch.type_as(cached_k), cached_k], dim=1)
+                full_v = torch.cat([float_v_batch.type_as(cached_v), cached_v], dim=1)
+                x = attention(roped_query, full_k, full_v)
+            elif self.use_float_tokens and self.float_bank is not None:
+                # V1 fallback: old path (kept for compatibility)
+                float_tokens = self.float_bank.get_all_tokens()
                 num_float_tokens = float_tokens.shape[0]
-
-                # Expand float tokens to batch size
-                float_tokens_expanded = float_tokens.unsqueeze(0).expand(b, -1, -1)  # [B, num_float_tokens, dim]
-
-                # Compute key and value for float tokens
+                float_tokens_expanded = float_tokens.unsqueeze(0).expand(b, -1, -1)
                 float_k = self.norm_k(self.k(float_tokens_expanded)).view(b, num_float_tokens, n, d)
                 float_v = self.v(float_tokens_expanded).view(b, num_float_tokens, n, d)
-
-                # Apply RoPE to float tokens (anchor at position 0)
                 float_grid_sizes = torch.ones_like(grid_sizes)
                 float_grid_sizes[:, 0] = 1
                 float_grid_sizes[:, 1:] = 1
                 roped_float_k = causal_rope_apply(float_k, float_grid_sizes, freqs, start_frame=0).type_as(v)
-                roped_float_v = float_v.type_as(v)
-
-                # Concatenate float tokens with KV cache for attention
-                kv_start = max(0, local_end_index - self.max_attention_size)
-                cached_k = kv_cache["k"][:, kv_start:local_end_index]
-                cached_v = kv_cache["v"][:, kv_start:local_end_index]
-
-                # Dynamic concatenation: float tokens + cached keys/values
                 full_k = torch.cat([roped_float_k, cached_k], dim=1)
-                full_v = torch.cat([roped_float_v, cached_v], dim=1)
-
+                full_v = torch.cat([float_v.type_as(v), cached_v], dim=1)
                 x = attention(roped_query, full_k, full_v)
             else:
-                x = attention(
-                    roped_query,
-                    kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
-                    kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
-                )
+                x = attention(roped_query, cached_k, cached_v)
             kv_cache["global_end_index"].fill_(current_end)
             kv_cache["local_end_index"].fill_(local_end_index)
 
@@ -587,7 +612,8 @@ class CausalWanAttentionBlock(nn.Module):
                  float_token_update_interval_short=1,
                  float_token_update_interval_mid=30,
                  float_token_update_interval_long=90,
-                 use_quality_scorer=True):
+                 use_quality_scorer=True,
+                 use_kv_bank_v2=True):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -612,7 +638,8 @@ class CausalWanAttentionBlock(nn.Module):
             float_token_update_interval_short=float_token_update_interval_short,
             float_token_update_interval_mid=float_token_update_interval_mid,
             float_token_update_interval_long=float_token_update_interval_long,
-            use_quality_scorer=use_quality_scorer
+            use_quality_scorer=use_quality_scorer,
+            use_kv_bank_v2=use_kv_bank_v2
         )
         self.norm3 = WanLayerNorm(
             dim, eps,
@@ -756,7 +783,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  float_token_update_interval_short=1,
                  float_token_update_interval_mid=30,
                  float_token_update_interval_long=90,
-                 use_quality_scorer=True):
+                 use_quality_scorer=True,
+                 use_kv_bank_v2=True):
         r"""
         Initialize the diffusion model backbone.
 
@@ -860,7 +888,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 float_token_update_interval_short=float_token_update_interval_short,
                 float_token_update_interval_mid=float_token_update_interval_mid,
                 float_token_update_interval_long=float_token_update_interval_long,
-                use_quality_scorer=use_quality_scorer
+                use_quality_scorer=use_quality_scorer,
+                use_kv_bank_v2=use_kv_bank_v2
             )
             for _ in range(num_layers)
         ])

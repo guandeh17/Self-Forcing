@@ -562,6 +562,296 @@ class FloatTokenDebugger:
                 print(f"{level.capitalize()} Mean Slot Norm: {mean_norm:.3f}")
 
 
+class FloatKVSlot(nn.Module):
+    """
+    Float KV Bank V2 - 直接存储K/V对，使用slot-attention更新
+    
+    解决了现有FloatTokenBank的双重投影问题：
+    - 旧版：存储压缩的input-space向量，注意力时再次投影成K/V
+    - 新版：直接存储K/V对，绕过input-space中间表示
+    
+    Args:
+        num_slots: slot数量
+        num_heads: 注意力头数
+        head_dim: 每个头的维度
+        alpha: EMA更新系数
+        update_interval: 更新间隔
+    """
+    
+    def __init__(
+        self,
+        num_slots: int = 4,
+        num_heads: int = 16,
+        head_dim: int = 128,
+        alpha: float = 0.2,
+        update_interval: int = 1,
+        eps: float = 1e-6
+    ):
+        super().__init__()
+        self.num_slots = num_slots
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.alpha = alpha
+        self.update_interval = update_interval
+        self.eps = eps
+        
+        # 直接存储K/V对 - shape: [num_slots, num_heads, head_dim]
+        self.register_buffer('slots_k', torch.zeros(num_slots, num_heads, head_dim))
+        self.register_buffer('slots_v', torch.zeros(num_slots, num_heads, head_dim))
+        
+        # 状态标记
+        self.register_buffer('initialized', torch.tensor(False, dtype=torch.bool))
+        self.register_buffer('update_count', torch.tensor(0, dtype=torch.long))
+    
+    def reset(self):
+        """重置states状态"""
+        self.slots_k.zero_()
+        self.slots_v.zero_()
+        self.initialized.fill_(False)
+        self.update_count.zero_()
+    
+    def update(
+        self,
+        evicted_k: torch.Tensor,
+        evicted_v: torch.Tensor,
+        quality_score: float = 1.0
+    ) -> Dict[str, torch.Tensor]:
+        """
+        使用被驱逐的K/V更新float KV bank
+        
+        Args:
+            evicted_k: 被驱逐的key [B, N, num_heads, head_dim] 或 [N, num_heads, head_dim]
+            evicted_v: 被驱逐的value [B, N, num_heads, head_dim] 或 [N, num_heads, head_dim]
+            quality_score: 质量分数，用于加权更新
+        
+        Returns:
+            stats: 更新统计信息
+        """
+        self.update_count += 1
+        
+        # 检查更新间隔
+        if self.update_count % self.update_interval != 0:
+            return {
+                'updated': False,
+                'update_count': self.update_count.item(),
+                'slot_k_norms': self.slots_k.norm(dim=-1).mean(dim=-1).detach()
+            }
+        
+        # 确保是4D [B, N, H, D]
+        if evicted_k.dim() == 3:
+            evicted_k = evicted_k.unsqueeze(0)
+            evicted_v = evicted_v.unsqueeze(0)
+        
+        batch_size = evicted_k.shape[0]
+        
+        # 对batch取平均 -> [N, num_heads, head_dim]
+        ek = evicted_k.mean(dim=0)  # [N, H, D]
+        ev = evicted_v.mean(dim=0)  # [N, H, D]
+        
+        with torch.no_grad():
+            # 首次初始化：将evicted tokens分块成num_slots组
+            if not self.initialized:
+                N = ek.shape[0]
+                if N >= self.num_slots:
+                    # 将N个tokens均匀分配到num_slots个slot
+                    tokens_per_slot = N // self.num_slots
+                    for i in range(self.num_slots):
+                        start_idx = i * tokens_per_slot
+                        if i == self.num_slots - 1:
+                            end_idx = N  # 最后一个slot取所有剩余
+                        else:
+                            end_idx = (i + 1) * tokens_per_slot
+                        self.slots_k[i] = ek[start_idx:end_idx].mean(dim=0)
+                        self.slots_v[i] = ev[start_idx:end_idx].mean(dim=0)
+                else:
+                    # 如果N < num_slots，轮询填充
+                    for i in range(self.num_slots):
+                        idx = i % N
+                        self.slots_k[i] = ek[idx]
+                        self.slots_v[i] = ev[idx]
+                
+                self.initialized.fill_(True)
+                return {
+                    'updated': True,
+                    'initialized': True,
+                    'slot_k_norms': self.slots_k.norm(dim=-1).mean(dim=-1).detach()
+                }
+            
+            # Slot Attention: 在head维度上平均后计算attention
+            # slots_k: [K, H, D] -> avg over heads -> [K, D]
+            # ek: [N, H, D] -> avg over heads -> [N, D]
+            slots_k_avg = self.slots_k.mean(dim=1)  # [K, D]
+            ek_avg = ek.mean(dim=1)  # [N, D]
+            ev_avg = ev.mean(dim=1)  # [N, D]
+            
+            # 计算attention logits: [K, N]
+            attn_logits = torch.einsum('kd,nd->kn', slots_k_avg, ek_avg) * (self.head_dim ** -0.5)
+            attn_weights = F.softmax(attn_logits, dim=-1)  # [K, N] - 每个slot对所有evicted tokens的权重
+            
+            # 计算新的K/V: 用attention weights加权求和
+            # [K, N] @ [N, H, D] -> [K, H, D]
+            new_k = torch.einsum('kn,nhd->khd', attn_weights, ek)
+            new_v = torch.einsum('kn,nhd->khd', attn_weights, ev)
+            
+            # 计算有效alpha（考虑quality_score）
+            eff_alpha = max(0.05, min(0.95, self.alpha * quality_score))
+            
+            # EMA更新
+            self.slots_k.mul_(1 - eff_alpha).add_(new_k, alpha=eff_alpha)
+            self.slots_v.mul_(1 - eff_alpha).add_(new_v, alpha=eff_alpha)
+        
+        return {
+            'updated': True,
+            'initialized': True,
+            'alpha': eff_alpha,
+            'quality_score': quality_score,
+            'slot_k_norms': self.slots_k.norm(dim=-1).mean(dim=-1).detach()
+        }
+    
+    def get_kv(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        获取当前所有slot的K/V对
+        
+        Returns:
+            slots_k: [num_slots, num_heads, head_dim]
+            slots_v: [num_slots, num_heads, head_dim]
+        """
+        return self.slots_k, self.slots_v
+
+
+class HierarchicalFloatKVBank(nn.Module):
+    """
+    分层Float KV Bank V2 - 使用FloatKVSlot
+    
+    与HierarchicalFloatBank概念相同，但直接存储KV对而非input-space向量。
+    
+    Args:
+        num_heads: 注意力头数
+        head_dim: 每个头的维度
+        num_slots_short/mid/long: 各层slot数量
+        alpha_short/mid/long: 各层EMA系数
+        update_interval_short/mid/long: 各层更新间隔
+        use_quality_scorer: 是否使用质量评分
+    """
+    
+    def __init__(
+        self,
+        num_heads: int = 16,
+        head_dim: int = 128,
+        num_slots_short: int = 4,
+        num_slots_mid: int = 4,
+        num_slots_long: int = 4,
+        alpha_short: float = 0.3,
+        alpha_mid: float = 0.15,
+        alpha_long: float = 0.05,
+        update_interval_short: int = 1,
+        update_interval_mid: int = 10,
+        update_interval_long: int = 30,
+        use_quality_scorer: bool = True,
+        eps: float = 1e-6
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.use_quality_scorer = use_quality_scorer
+        
+        # 创建三层FloatKVSlot
+        self.bank_short = FloatKVSlot(
+            num_slots=num_slots_short,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            alpha=alpha_short,
+            update_interval=update_interval_short,
+            eps=eps
+        )
+        
+        self.bank_mid = FloatKVSlot(
+            num_slots=num_slots_mid,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            alpha=alpha_mid,
+            update_interval=update_interval_mid,
+            eps=eps
+        )
+        
+        self.bank_long = FloatKVSlot(
+            num_slots=num_slots_long,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            alpha=alpha_long,
+            update_interval=update_interval_long,
+            eps=eps
+        )
+        
+        # 质量评分器
+        if use_quality_scorer:
+            self.quality_scorer = FrameQualityScorer(num_heads * head_dim, eps)
+        else:
+            self.quality_scorer = None
+        
+        self.total_slots = num_slots_short + num_slots_mid + num_slots_long
+    
+    def reset(self):
+        """重置所有层状态"""
+        self.bank_short.reset()
+        self.bank_mid.reset()
+        self.bank_long.reset()
+        if self.quality_scorer is not None:
+            self.quality_scorer.reset()
+    
+    def update(
+        self,
+        evicted_k: torch.Tensor,
+        evicted_v: torch.Tensor,
+        frame_hidden: Optional[torch.Tensor] = None
+    ) -> Dict[str, any]:
+        """
+        更新所有层的float KV
+        
+        Args:
+            evicted_k: 被驱逐的key [B, N, num_heads, head_dim]
+            evicted_v: 被驱逐的value [B, N, num_heads, head_dim]
+            frame_hidden: 当前帧的隐藏状态（用于质量评分，可选）
+        
+        Returns:
+            stats: 各层更新统计信息
+        """
+        # 计算质量分数
+        quality_score = 1.0
+        if self.quality_scorer is not None and frame_hidden is not None:
+            with torch.no_grad():
+                quality_score = self.quality_scorer(frame_hidden).mean().item()
+        
+        # 更新各层
+        stats_short = self.bank_short.update(evicted_k, evicted_v, quality_score)
+        stats_mid = self.bank_mid.update(evicted_k, evicted_v, quality_score)
+        stats_long = self.bank_long.update(evicted_k, evicted_v, quality_score)
+        
+        return {
+            'short': stats_short,
+            'mid': stats_mid,
+            'long': stats_long,
+            'quality_score': quality_score
+        }
+    
+    def get_all_kv(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        获取所有层的float K/V对，按slot维度拼接
+        
+        Returns:
+            float_k: [total_slots, num_heads, head_dim]
+            float_v: [total_slots, num_heads, head_dim]
+        """
+        k_short, v_short = self.bank_short.get_kv()
+        k_mid, v_mid = self.bank_mid.get_kv()
+        k_long, v_long = self.bank_long.get_kv()
+        
+        float_k = torch.cat([k_short, k_mid, k_long], dim=0)
+        float_v = torch.cat([v_short, v_mid, v_long], dim=0)
+        
+        return float_k, float_v
+
+
 # 便捷函数
 def create_hierarchical_float_bank(
     d_model: int = 2048,
