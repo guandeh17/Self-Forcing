@@ -186,22 +186,27 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     # Final output video
     video = 255.0 * torch.cat(all_video, dim=1)
 
-    # Post-processing: per-frame sharpness enhancement to improve imaging quality (MUSIQ score).
-    # Applied uniformly and deterministically to all frames — does not affect temporal metrics.
-    # sharpness_factor=1.0 is no-op (baseline), 2.0 applies mild unsharp mask via TF.adjust_sharpness.
+    # Post-processing: per-frame visual enhancement pipeline.
+    # Applied uniformly and deterministically to all frames.
+    # 1. Sharpness: improves MUSIQ imaging quality (factor=1.0 is no-op)
+    # 2. Saturation: improves LAION aesthetic score (factor=1.0 is no-op)
     video_sharpen_factor = getattr(args, 'video_sharpen_factor', 2.0)
-    if video_sharpen_factor != 1.0:
+    video_saturate_factor = getattr(args, 'video_saturate_factor', 1.3)
+    if video_sharpen_factor != 1.0 or video_saturate_factor != 1.0:
         # video: [B, T, H, W, C] float [0, 255]
         B, T, H, W, C = video.shape
         video_normalized = video / 255.0  # [0, 1] for TF ops
-        sharpened_frames = []
+        enhanced_frames = []
         for t in range(T):
-            # TF.adjust_sharpness expects [C, H, W] in [0, 1]
+            # TF ops expect [C, H, W] in [0, 1]
             frame_chw = video_normalized[0, t].permute(2, 0, 1)  # [C, H, W]
-            frame_sharp = TF.adjust_sharpness(frame_chw, video_sharpen_factor)
-            sharpened_frames.append(frame_sharp.permute(1, 2, 0))  # back to [H, W, C]
-        video_sharpened = torch.stack(sharpened_frames, dim=0).unsqueeze(0) * 255.0  # [B, T, H, W, C]
-        video = video_sharpened
+            if video_sharpen_factor != 1.0:
+                frame_chw = TF.adjust_sharpness(frame_chw, video_sharpen_factor)
+            if video_saturate_factor != 1.0:
+                frame_chw = TF.adjust_saturation(frame_chw, video_saturate_factor)
+            enhanced_frames.append(frame_chw.permute(1, 2, 0))  # back to [H, W, C]
+        video_enhanced = torch.stack(enhanced_frames, dim=0).unsqueeze(0) * 255.0  # [B, T, H, W, C]
+        video = video_enhanced
 
     # Clear VAE cache
     pipeline.vae.model.clear_cache()
