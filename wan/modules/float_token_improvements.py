@@ -5,6 +5,9 @@ Float Token 算法改进模块
 - FloatTokenBank: EMA 动态更新机制
 - FrameQualityScorer: 帧质量感知筛选
 - HierarchicalFloatBank: 分层 Float Token 设计
+- DynamicIntervalScheduler: 基于内容稳定性的动态更新间隔
+- TemporalCoherenceScorer: 多帧时间一致性评分
+- ProgressiveBankActivation: 渐进式银行激活
 - RoPE 对齐辅助函数
 
 作者: Claude
@@ -16,6 +19,337 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Optional, List, Dict, Tuple
+from collections import deque
+
+
+# =============================================================================
+# Layer-Adaptive Configuration Helpers
+# =============================================================================
+
+# Layer configuration presets for Wan 1.3B (32 layers)
+LAYER_CONFIGS = {
+    'memory_efficient': {
+        'early': {'layers': range(0, 10), 'short': 2, 'mid': 0, 'long': 0},
+        'middle': {'layers': range(10, 22), 'short': 4, 'mid': 4, 'long': 2},
+        'late': {'layers': range(22, 32), 'short': 4, 'mid': 4, 'long': 8},
+    },
+    'uniform': {
+        'all': {'short': 4, 'mid': 4, 'long': 4}
+    }
+}
+
+
+def get_layer_float_config(layer_idx: int, num_layers: int = 32,
+                           preset: str = 'memory_efficient') -> dict:
+    """
+    Get float token config for specific layer.
+    
+    Args:
+        layer_idx: Layer index (0 to num_layers-1)
+        num_layers: Total number of layers
+        preset: Configuration preset ('memory_efficient' or 'uniform')
+        
+    Returns:
+        Dict with 'short', 'mid', 'long' slot counts
+    """
+    if preset == 'uniform':
+        return LAYER_CONFIGS['uniform']['all'].copy()
+    
+    for tier, config in LAYER_CONFIGS['memory_efficient'].items():
+        if layer_idx in config['layers']:
+            return {k: v for k, v in config.items() if k != 'layers'}
+    
+    # Default to middle config
+    return {k: v for k, v in LAYER_CONFIGS['memory_efficient']['middle'].items()
+            if k != 'layers'}
+
+
+def create_adaptive_float_token_config(
+    num_target_frames: int = 1920,  # 1 minute @ 16fps
+    use_layer_adaptive: bool = True,
+    use_dynamic_intervals: bool = True,
+    use_temporal_coherence: bool = True,
+    use_progressive_activation: bool = True,
+) -> dict:
+    """
+    Create optimal float token configuration for long video generation.
+    
+    Args:
+        num_target_frames: Target number of frames for video generation
+        use_layer_adaptive: Enable layer-adaptive slot configuration
+        use_dynamic_intervals: Enable dynamic update intervals
+        use_temporal_coherence: Enable temporal coherence scoring
+        use_progressive_activation: Enable progressive bank activation
+        
+    Returns:
+        model_kwargs dict with all adaptive features enabled
+    """
+    return {
+        "use_float_tokens": True,
+        "use_kv_bank_v2": True,
+        "use_layer_adaptive_float_tokens": use_layer_adaptive,
+        "layer_config_preset": "memory_efficient",
+        "use_dynamic_intervals": use_dynamic_intervals,
+        "dynamic_interval_min_factor": 0.5,
+        "dynamic_interval_max_factor": 3.0,
+        "use_temporal_coherence": use_temporal_coherence,
+        "coherence_history_size": 30,
+        "use_progressive_activation": use_progressive_activation,
+        "progressive_warmup_frames": min(300, num_target_frames // 6),
+        # Base slot counts (will be overridden by layer-adaptive config)
+        "float_token_num_slots_short": 4,
+        "float_token_num_slots_mid": 4,
+        "float_token_num_slots_long": 4,
+    }
+
+
+# =============================================================================
+# Dynamic Update Interval Scheduler
+# =============================================================================
+
+class DynamicIntervalScheduler:
+    """
+    Adjust update intervals based on content stability.
+    
+    High similarity (stable scene) -> longer intervals
+    Low similarity (changing scene) -> shorter intervals
+    
+    Args:
+        base_interval: Base update interval
+        min_factor: Minimum interval factor (default 0.5)
+        max_factor: Maximum interval factor (default 3.0)
+        history_size: Size of stability history for smoothing
+    """
+    
+    def __init__(self, base_interval: int, min_factor: float = 0.5,
+                 max_factor: float = 3.0, history_size: int = 10):
+        self.base_interval = base_interval
+        self.min_interval = max(1, int(base_interval * min_factor))
+        self.max_interval = int(base_interval * max_factor)
+        self.stability_history = deque(maxlen=history_size)
+    
+    def get_interval(self, cosine_similarity: float) -> int:
+        """
+        Compute dynamic interval based on stability.
+        
+        Args:
+            cosine_similarity: Cosine similarity between current and previous content
+                               Range: [-1, 1]
+        
+        Returns:
+            Dynamic interval (integer)
+        """
+        # Normalize to [0, 1]
+        stability_score = (cosine_similarity + 1) / 2
+        self.stability_history.append(stability_score)
+        avg_stability = sum(self.stability_history) / len(self.stability_history)
+        
+        # More stable = longer interval (up to 3x base)
+        interval = int(self.base_interval * (1 + 2 * avg_stability))
+        return max(self.min_interval, min(self.max_interval, interval))
+    
+    def reset(self):
+        """Reset the scheduler state."""
+        self.stability_history.clear()
+
+
+# =============================================================================
+# Temporal Coherence Scorer
+# =============================================================================
+
+class TemporalCoherenceScorer(nn.Module):
+    """
+    Multi-frame temporal coherence scoring.
+    
+    Tracks consistency across multiple timescales:
+    - Short (2-3 frames): Detect flickering
+    - Mid (5-10 frames): Detect gradual drift
+    - Long (20+ frames): Detect semantic inconsistency
+    
+    Args:
+        d_model: Model dimension
+        history_size: Number of frames to keep in history
+    """
+    
+    def __init__(self, d_model: int, history_size: int = 30):
+        super().__init__()
+        self.d_model = d_model
+        self.history_size = history_size
+        
+        # Frame history buffer
+        self.register_buffer('frame_history', torch.zeros(history_size, d_model))
+        self.register_buffer('history_ptr', torch.tensor(0, dtype=torch.long))
+        self.register_buffer('history_count', torch.tensor(0, dtype=torch.long))
+    
+    def reset(self):
+        """Reset the scorer state."""
+        self.frame_history.zero_()
+        self.history_ptr.zero_()
+        self.history_count.zero_()
+    
+    def update_history(self, frame_vec: torch.Tensor):
+        """
+        Add frame to history buffer.
+        
+        Args:
+            frame_vec: Frame vector [d_model] or [seq_len, d_model]
+        """
+        with torch.no_grad():
+            idx = self.history_ptr.item()
+            if frame_vec.dim() == 2:
+                frame_vec = frame_vec.mean(dim=0)
+            self.frame_history[idx] = frame_vec.detach()
+            self.history_ptr = (self.history_ptr + 1) % self.history_size
+            self.history_count = min(self.history_count + 1, self.history_size)
+    
+    def _get_recent_frames(self, n: int) -> torch.Tensor:
+        """Get the most recent n frames from history."""
+        count = self.history_count.item()
+        n = min(n, count)
+        
+        if n == 0:
+            return self.frame_history[:1]
+        
+        end_idx = self.history_ptr.item()
+        start_idx = (end_idx - n) % self.history_size
+        
+        if start_idx < end_idx:
+            return self.frame_history[start_idx:end_idx]
+        else:
+            # Wrap around
+            return torch.cat([self.frame_history[start_idx:], self.frame_history[:end_idx]], dim=0)
+    
+    def compute_coherence(self, current_frame: torch.Tensor) -> Tuple[torch.Tensor, float]:
+        """
+        Compute temporal coherence scores.
+        
+        Args:
+            current_frame: Current frame tokens [seq_len, d_model] or [d_model]
+        
+        Returns:
+            scores: [short, mid, long] coherence scores
+            overall: weighted overall coherence (geometric mean)
+        """
+        if self.history_count < 5:
+            return torch.ones(3, device=current_frame.device), 1.0
+        
+        with torch.no_grad():
+            if current_frame.dim() == 2:
+                current_vec = current_frame.mean(dim=0)
+            else:
+                current_vec = current_frame
+            
+            # Get history windows
+            short_window = self._get_recent_frames(3)
+            mid_window = self._get_recent_frames(10)
+            long_window = self._get_recent_frames(min(30, self.history_count.item()))
+            
+            # Compute similarities
+            short_sim = F.cosine_similarity(
+                current_vec.unsqueeze(0),
+                short_window.mean(dim=0, keepdim=True),
+                dim=-1
+            ).mean()
+            
+            mid_sim = F.cosine_similarity(
+                current_vec.unsqueeze(0),
+                mid_window.mean(dim=0, keepdim=True),
+                dim=-1
+            ).mean()
+            
+            long_sim = F.cosine_similarity(
+                current_vec.unsqueeze(0),
+                long_window.mean(dim=0, keepdim=True),
+                dim=-1
+            ).mean()
+            
+            scores = torch.stack([short_sim, mid_sim, long_sim])
+            # Normalize from [-1, 1] to [0, 1] for geometric mean
+            scores_normalized = (scores + 1) / 2
+            # Geometric mean for overall coherence
+            overall = (scores_normalized.prod().item() + 1e-8) ** (1/3)
+            
+            return scores, overall
+    
+    def forward(self, current_frame: torch.Tensor) -> Tuple[torch.Tensor, float]:
+        """Forward interface, same as compute_coherence."""
+        return self.compute_coherence(current_frame)
+
+
+# =============================================================================
+# Progressive Bank Activation
+# =============================================================================
+
+class ProgressiveBankActivation:
+    """
+    Gradually activate long-term float tokens as video progresses.
+    Prevents early-frame bias in long-term memory.
+    
+    Args:
+        warmup_frames: Number of frames for warmup (default 300 ~ 20s @ 16fps)
+    """
+    
+    def __init__(self, warmup_frames: int = 300):
+        self.warmup_frames = warmup_frames
+        self.frame_count = 0
+    
+    def get_long_term_weight(self) -> float:
+        """
+        Get weight for long-term bank [0, 1].
+        
+        Returns:
+            Weight value between 0 and 1
+        """
+        if self.frame_count < self.warmup_frames:
+            return self.frame_count / self.warmup_frames
+        return 1.0
+    
+    def get_effective_alpha(self, base_alpha: float, bank_type: str = 'short') -> float:
+        """
+        Adjust alpha based on progression and bank type.
+        
+        Args:
+            base_alpha: Base alpha value
+            bank_type: Type of bank ('short', 'mid', or 'long')
+        
+        Returns:
+            Adjusted alpha value
+        """
+        if bank_type == 'short':
+            return base_alpha
+        elif bank_type == 'mid':
+            progress = min(1.0, self.frame_count / (self.warmup_frames / 2))
+            return base_alpha * (1 + 0.3 * progress)
+        else:  # long
+            weight = self.get_long_term_weight()
+            return base_alpha * (0.3 + 0.7 * weight)
+    
+    def step(self, num_frames: int = 1):
+        """
+        Advance frame counter.
+        
+        Args:
+            num_frames: Number of frames to advance
+        """
+        self.frame_count += num_frames
+    
+    def reset(self):
+        """Reset the activation state."""
+        self.frame_count = 0
+    
+    def get_progress(self) -> float:
+        """
+        Get current progress as a ratio [0, 1].
+        
+        Returns:
+            Progress ratio
+        """
+        return min(1.0, self.frame_count / self.warmup_frames)
+
+
+# =============================================================================
+# Original Components
+# =============================================================================
 
 
 class FrameQualityScorer(nn.Module):
@@ -576,6 +910,9 @@ class FloatKVSlot(nn.Module):
         head_dim: 每个头的维度
         alpha: EMA更新系数
         update_interval: 更新间隔
+        use_dynamic_intervals: 是否使用动态更新间隔
+        dynamic_interval_min_factor: 动态间隔最小因子
+        dynamic_interval_max_factor: 动态间隔最大因子
     """
     
     def __init__(
@@ -587,15 +924,19 @@ class FloatKVSlot(nn.Module):
         update_interval: int = 1,
         eps: float = 1e-6,
         use_fifo_slots: bool = True,  # FIFO slot assignment for temporal diversity
+        use_dynamic_intervals: bool = False,
+        dynamic_interval_min_factor: float = 0.5,
+        dynamic_interval_max_factor: float = 3.0,
     ):
         super().__init__()
         self.num_slots = num_slots
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.alpha = alpha
-        self.update_interval = update_interval
+        self.base_update_interval = update_interval
         self.eps = eps
         self.use_fifo_slots = use_fifo_slots
+        self.use_dynamic_intervals = use_dynamic_intervals
 
         # 直接存储K/V对 - shape: [num_slots, num_heads, head_dim]
         self.register_buffer('slots_k', torch.zeros(num_slots, num_heads, head_dim))
@@ -612,6 +953,16 @@ class FloatKVSlot(nn.Module):
         # Content-Adaptive Alpha: 存储前一次的evicted_k平均值
         self.register_buffer('prev_evicted_k_avg', torch.zeros(num_heads, head_dim))
         self.register_buffer('has_prev', torch.tensor(False, dtype=torch.bool))
+        
+        # Dynamic interval scheduler (only created if needed)
+        if use_dynamic_intervals:
+            self.interval_scheduler = DynamicIntervalScheduler(
+                base_interval=update_interval,
+                min_factor=dynamic_interval_min_factor,
+                max_factor=dynamic_interval_max_factor
+            )
+        else:
+            self.interval_scheduler = None
     
     def reset(self):
         """重置states状态"""
@@ -623,6 +974,8 @@ class FloatKVSlot(nn.Module):
         self.has_prev.fill_(False)
         self.slot_write_ptr.zero_()
         self.slot_written.fill_(False)
+        if self.interval_scheduler is not None:
+            self.interval_scheduler.reset()
     
     def _compute_adaptive_alpha(self, evicted_k: torch.Tensor) -> float:
         """
@@ -690,11 +1043,27 @@ class FloatKVSlot(nn.Module):
 
         self.update_count += 1
 
+        # 确定当前更新间隔
+        if self.use_dynamic_intervals and self.interval_scheduler is not None:
+            # 计算内容相似度用于动态间隔
+            if self.has_prev:
+                with torch.no_grad():
+                    ek = evicted_k.mean(dim=0) if evicted_k.dim() == 3 else evicted_k.mean(dim=0)
+                    cosine_sim = F.cosine_similarity(
+                        ek, self.prev_evicted_k_avg, dim=-1, eps=self.eps
+                    ).mean().item()
+            else:
+                cosine_sim = 0.0  # 默认中等相似度
+            current_interval = self.interval_scheduler.get_interval(cosine_sim)
+        else:
+            current_interval = self.base_update_interval
+
         # 检查更新间隔
-        if self.update_count % self.update_interval != 0:
+        if self.update_count % current_interval != 0:
             return {
                 'updated': False,
                 'update_count': self.update_count.item(),
+                'current_interval': current_interval,
                 'slot_k_norms': self.slots_k.norm(dim=-1).mean(dim=-1).detach()
             }
         
@@ -839,6 +1208,10 @@ class HierarchicalFloatKVBank(nn.Module):
         alpha_short/mid/long: 各层EMA系数
         update_interval_short/mid/long: 各层更新间隔
         use_quality_scorer: 是否使用质量评分
+        use_temporal_coherence: 是否使用时间一致性评分
+        use_progressive_activation: 是否使用渐进式银行激活
+        use_dynamic_intervals: 是否使用动态更新间隔
+        progressive_warmup_frames: 渐进式激活的warmup帧数
     """
     
     def __init__(
@@ -855,12 +1228,21 @@ class HierarchicalFloatKVBank(nn.Module):
         update_interval_mid: int = 10,
         update_interval_long: int = 30,
         use_quality_scorer: bool = True,
+        use_temporal_coherence: bool = False,
+        use_progressive_activation: bool = False,
+        use_dynamic_intervals: bool = False,
+        progressive_warmup_frames: int = 300,
+        coherence_history_size: int = 30,
+        dynamic_interval_min_factor: float = 0.5,
+        dynamic_interval_max_factor: float = 3.0,
         eps: float = 1e-6
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.use_quality_scorer = use_quality_scorer
+        self.use_temporal_coherence = use_temporal_coherence
+        self.use_progressive_activation = use_progressive_activation
         
         # 创建三层FloatKVSlot
         self.bank_short = FloatKVSlot(
@@ -869,7 +1251,10 @@ class HierarchicalFloatKVBank(nn.Module):
             head_dim=head_dim,
             alpha=alpha_short,
             update_interval=update_interval_short,
-            eps=eps
+            eps=eps,
+            use_dynamic_intervals=use_dynamic_intervals,
+            dynamic_interval_min_factor=dynamic_interval_min_factor,
+            dynamic_interval_max_factor=dynamic_interval_max_factor
         )
         
         self.bank_mid = FloatKVSlot(
@@ -878,7 +1263,10 @@ class HierarchicalFloatKVBank(nn.Module):
             head_dim=head_dim,
             alpha=alpha_mid,
             update_interval=update_interval_mid,
-            eps=eps
+            eps=eps,
+            use_dynamic_intervals=use_dynamic_intervals,
+            dynamic_interval_min_factor=dynamic_interval_min_factor,
+            dynamic_interval_max_factor=dynamic_interval_max_factor
         )
         
         self.bank_long = FloatKVSlot(
@@ -887,16 +1275,31 @@ class HierarchicalFloatKVBank(nn.Module):
             head_dim=head_dim,
             alpha=alpha_long,
             update_interval=update_interval_long,
-            eps=eps
+            eps=eps,
+            use_dynamic_intervals=use_dynamic_intervals,
+            dynamic_interval_min_factor=dynamic_interval_min_factor,
+            dynamic_interval_max_factor=dynamic_interval_max_factor
         )
         
-        # 质量评分器
-        if use_quality_scorer:
+        # 质量评分器（可选择类型）
+        if use_temporal_coherence:
+            self.coherence_scorer = TemporalCoherenceScorer(num_heads * head_dim, coherence_history_size)
+            self.quality_scorer = None
+        elif use_quality_scorer:
             self.quality_scorer = FrameQualityScorer(num_heads * head_dim, eps)
+            self.coherence_scorer = None
         else:
             self.quality_scorer = None
+            self.coherence_scorer = None
+        
+        # 渐进式激活
+        if use_progressive_activation:
+            self.progressive_activation = ProgressiveBankActivation(progressive_warmup_frames)
+        else:
+            self.progressive_activation = None
         
         self.total_slots = num_slots_short + num_slots_mid + num_slots_long
+        self._alphas = {'short': alpha_short, 'mid': alpha_mid, 'long': alpha_long}
     
     def reset(self):
         """重置所有层状态"""
@@ -905,6 +1308,10 @@ class HierarchicalFloatKVBank(nn.Module):
         self.bank_long.reset()
         if self.quality_scorer is not None:
             self.quality_scorer.reset()
+        if self.coherence_scorer is not None:
+            self.coherence_scorer.reset()
+        if self.progressive_activation is not None:
+            self.progressive_activation.reset()
     
     def update(
         self,
@@ -918,23 +1325,55 @@ class HierarchicalFloatKVBank(nn.Module):
         Args:
             evicted_k: 被驱逐的key [B, N, num_heads, head_dim]
             evicted_v: 被驱逐的value [B, N, num_heads, head_dim]
-            frame_hidden: 当前帧的隐藏状态（用于质量评分，可选）
+            frame_hidden: 当前帧的隐藏状态（用于质量评分/一致性，可选）
         
         Returns:
             stats: 各层更新统计信息
         """
-        # 计算质量分数
+        # 计算质量分数或一致性分数
         quality_score = 1.0
-        if self.quality_scorer is not None and frame_hidden is not None:
+        coherence_scores = None
+        coherence_overall = 1.0
+        
+        if frame_hidden is not None:
             with torch.no_grad():
-                quality_score = self.quality_scorer(frame_hidden).mean().item()
+                if self.coherence_scorer is not None:
+                    coherence_scores, coherence_overall = self.coherence_scorer(frame_hidden)
+                    quality_score = coherence_overall
+                    # Update coherence history
+                    self.coherence_scorer.update_history(frame_hidden)
+                elif self.quality_scorer is not None:
+                    quality_score = self.quality_scorer(frame_hidden).mean().item()
+        
+        # 如果使用渐进式激活，调整各层的有效alpha
+        if self.progressive_activation is not None:
+            eff_alpha_short = self.progressive_activation.get_effective_alpha(
+                self._alphas['short'], 'short')
+            eff_alpha_mid = self.progressive_activation.get_effective_alpha(
+                self._alphas['mid'], 'mid')
+            eff_alpha_long = self.progressive_activation.get_effective_alpha(
+                self._alphas['long'], 'long')
+            # Temporarily override alpha values
+            orig_alpha_short = self.bank_short.alpha
+            orig_alpha_mid = self.bank_mid.alpha
+            orig_alpha_long = self.bank_long.alpha
+            self.bank_short.alpha = eff_alpha_short
+            self.bank_mid.alpha = eff_alpha_mid
+            self.bank_long.alpha = eff_alpha_long
         
         # 更新各层
         stats_short = self.bank_short.update(evicted_k, evicted_v, quality_score)
         stats_mid = self.bank_mid.update(evicted_k, evicted_v, quality_score)
         stats_long = self.bank_long.update(evicted_k, evicted_v, quality_score)
         
-        return {
+        # 恢复原始alpha值
+        if self.progressive_activation is not None:
+            self.bank_short.alpha = orig_alpha_short
+            self.bank_mid.alpha = orig_alpha_mid
+            self.bank_long.alpha = orig_alpha_long
+        
+        # 构建返回统计信息
+        result = {
             'short': stats_short,
             'mid': stats_mid,
             'long': stats_long,
@@ -943,6 +1382,26 @@ class HierarchicalFloatKVBank(nn.Module):
             'adaptive_alpha_mid': stats_mid.get('adaptive_alpha', self.bank_mid.alpha),
             'adaptive_alpha_long': stats_long.get('adaptive_alpha', self.bank_long.alpha)
         }
+        
+        if coherence_scores is not None:
+            result['coherence_scores'] = coherence_scores.cpu().tolist()
+            result['coherence_overall'] = coherence_overall
+        
+        if self.progressive_activation is not None:
+            result['progress'] = self.progressive_activation.get_progress()
+            result['long_term_weight'] = self.progressive_activation.get_long_term_weight()
+        
+        return result
+    
+    def step(self, num_frames: int = 1):
+        """
+        推进时间步（用于渐进式激活）
+        
+        Args:
+            num_frames: 推进的帧数
+        """
+        if self.progressive_activation is not None:
+            self.progressive_activation.step(num_frames)
     
     def get_all_kv(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -955,6 +1414,12 @@ class HierarchicalFloatKVBank(nn.Module):
         k_short, v_short = self.bank_short.get_kv()
         k_mid, v_mid = self.bank_mid.get_kv()
         k_long, v_long = self.bank_long.get_kv()
+        
+        # 如果使用渐进式激活，根据权重调整长期bank的贡献
+        if self.progressive_activation is not None and k_long.shape[0] > 0:
+            long_weight = self.progressive_activation.get_long_term_weight()
+            if long_weight < 1.0:
+                v_long = v_long * long_weight
         
         float_k = torch.cat([k_short, k_mid, k_long], dim=0)
         float_v = torch.cat([v_short, v_mid, v_long], dim=0)

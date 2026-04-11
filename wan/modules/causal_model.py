@@ -26,6 +26,11 @@ try:
         HierarchicalFloatKVBank,
         FloatKVSlot,
         FrameQualityScorer,
+        DynamicIntervalScheduler,
+        TemporalCoherenceScorer,
+        ProgressiveBankActivation,
+        get_layer_float_config,
+        create_adaptive_float_token_config,
         apply_rope_with_float_tokens,
         causal_rope_apply_with_float_tokens
     )
@@ -92,7 +97,14 @@ class CausalWanSelfAttention(nn.Module):
                  float_token_update_interval_mid=30,
                  float_token_update_interval_long=90,
                  use_quality_scorer=True,
-                 use_kv_bank_v2=True):
+                 use_kv_bank_v2=True,
+                 use_dynamic_intervals=False,
+                 use_temporal_coherence=False,
+                 use_progressive_activation=False,
+                 progressive_warmup_frames=300,
+                 coherence_history_size=30,
+                 dynamic_interval_min_factor=0.5,
+                 dynamic_interval_max_factor=3.0):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
@@ -154,7 +166,15 @@ class CausalWanSelfAttention(nn.Module):
                 update_interval_short=float_token_update_interval_short,
                 update_interval_mid=float_token_update_interval_mid,
                 update_interval_long=float_token_update_interval_long,
-                use_quality_scorer=use_quality_scorer
+                use_quality_scorer=use_quality_scorer,
+                use_temporal_coherence=use_temporal_coherence,
+                use_progressive_activation=use_progressive_activation,
+                use_dynamic_intervals=use_dynamic_intervals,
+                progressive_warmup_frames=progressive_warmup_frames,
+                coherence_history_size=coherence_history_size,
+                dynamic_interval_min_factor=dynamic_interval_min_factor,
+                dynamic_interval_max_factor=dynamic_interval_max_factor,
+                eps=eps
             )
         else:
             self.float_kv_bank = None
@@ -626,7 +646,15 @@ class CausalWanAttentionBlock(nn.Module):
                  float_token_update_interval_mid=30,
                  float_token_update_interval_long=90,
                  use_quality_scorer=True,
-                 use_kv_bank_v2=True):
+                 use_kv_bank_v2=True,
+                 layer_idx=0,
+                 use_dynamic_intervals=False,
+                 use_temporal_coherence=False,
+                 use_progressive_activation=False,
+                 progressive_warmup_frames=300,
+                 coherence_history_size=30,
+                 dynamic_interval_min_factor=0.5,
+                 dynamic_interval_max_factor=3.0):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -635,6 +663,7 @@ class CausalWanAttentionBlock(nn.Module):
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
+        self.layer_idx = layer_idx
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
@@ -652,7 +681,14 @@ class CausalWanAttentionBlock(nn.Module):
             float_token_update_interval_mid=float_token_update_interval_mid,
             float_token_update_interval_long=float_token_update_interval_long,
             use_quality_scorer=use_quality_scorer,
-            use_kv_bank_v2=use_kv_bank_v2
+            use_kv_bank_v2=use_kv_bank_v2,
+            use_dynamic_intervals=use_dynamic_intervals,
+            use_temporal_coherence=use_temporal_coherence,
+            use_progressive_activation=use_progressive_activation,
+            progressive_warmup_frames=progressive_warmup_frames,
+            coherence_history_size=coherence_history_size,
+            dynamic_interval_min_factor=dynamic_interval_min_factor,
+            dynamic_interval_max_factor=dynamic_interval_max_factor
         )
         self.norm3 = WanLayerNorm(
             dim, eps,
@@ -797,7 +833,16 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  float_token_update_interval_mid=30,
                  float_token_update_interval_long=90,
                  use_quality_scorer=True,
-                 use_kv_bank_v2=True):
+                 use_kv_bank_v2=True,
+                 use_layer_adaptive_float_tokens=False,
+                 layer_config_preset='memory_efficient',
+                 use_dynamic_intervals=False,
+                 use_temporal_coherence=False,
+                 use_progressive_activation=False,
+                 progressive_warmup_frames=300,
+                 coherence_history_size=30,
+                 dynamic_interval_min_factor=0.5,
+                 dynamic_interval_max_factor=3.0):
         r"""
         Initialize the diffusion model backbone.
 
@@ -846,6 +891,24 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 Update interval (in frames) for each time scale
             use_quality_scorer (`bool`, *optional*, defaults to True):
                 Enable quality-based filtering for float token updates
+            use_layer_adaptive_float_tokens (`bool`, *optional*, defaults to False):
+                Enable layer-adaptive float token configuration
+            layer_config_preset (`str`, *optional*, defaults to 'memory_efficient'):
+                Layer configuration preset ('memory_efficient' or 'uniform')
+            use_dynamic_intervals (`bool`, *optional*, defaults to False):
+                Enable dynamic update intervals based on content stability
+            use_temporal_coherence (`bool`, *optional*, defaults to False):
+                Enable temporal coherence scoring for multi-frame consistency
+            use_progressive_activation (`bool`, *optional*, defaults to False):
+                Enable progressive activation of long-term float tokens
+            progressive_warmup_frames (`int`, *optional*, defaults to 300):
+                Number of frames for progressive warmup
+            coherence_history_size (`int`, *optional*, defaults to 30):
+                Size of coherence history buffer
+            dynamic_interval_min_factor (`float`, *optional*, defaults to 0.5):
+                Minimum interval factor for dynamic intervals
+            dynamic_interval_max_factor (`float`, *optional*, defaults to 3.0):
+                Maximum interval factor for dynamic intervals
         """
 
         super().__init__()
@@ -886,26 +949,49 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # blocks
         cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
-        self.blocks = nn.ModuleList([
-            CausalWanAttentionBlock(
-                cross_attn_type, dim, ffn_dim, num_heads,
-                local_attn_size, sink_size, qk_norm, cross_attn_norm, eps,
-                use_float_tokens=use_float_tokens,
-                use_hierarchical_float_tokens=use_hierarchical_float_tokens,
-                float_token_num_slots_short=float_token_num_slots_short,
-                float_token_num_slots_mid=float_token_num_slots_mid,
-                float_token_num_slots_long=float_token_num_slots_long,
-                float_token_alpha_short=float_token_alpha_short,
-                float_token_alpha_mid=float_token_alpha_mid,
-                float_token_alpha_long=float_token_alpha_long,
-                float_token_update_interval_short=float_token_update_interval_short,
-                float_token_update_interval_mid=float_token_update_interval_mid,
-                float_token_update_interval_long=float_token_update_interval_long,
-                use_quality_scorer=use_quality_scorer,
-                use_kv_bank_v2=use_kv_bank_v2
+        
+        # Build blocks with optional layer-adaptive configuration
+        blocks = []
+        for layer_idx in range(num_layers):
+            # Get layer-specific config if adaptive mode is enabled
+            if use_layer_adaptive_float_tokens and FLOAT_TOKEN_AVAILABLE:
+                layer_config = get_layer_float_config(layer_idx, num_layers, layer_config_preset)
+                layer_short = layer_config['short']
+                layer_mid = layer_config['mid']
+                layer_long = layer_config['long']
+            else:
+                layer_short = float_token_num_slots_short
+                layer_mid = float_token_num_slots_mid
+                layer_long = float_token_num_slots_long
+            
+            blocks.append(
+                CausalWanAttentionBlock(
+                    cross_attn_type, dim, ffn_dim, num_heads,
+                    local_attn_size, sink_size, qk_norm, cross_attn_norm, eps,
+                    use_float_tokens=use_float_tokens,
+                    use_hierarchical_float_tokens=use_hierarchical_float_tokens,
+                    float_token_num_slots_short=layer_short,
+                    float_token_num_slots_mid=layer_mid,
+                    float_token_num_slots_long=layer_long,
+                    float_token_alpha_short=float_token_alpha_short,
+                    float_token_alpha_mid=float_token_alpha_mid,
+                    float_token_alpha_long=float_token_alpha_long,
+                    float_token_update_interval_short=float_token_update_interval_short,
+                    float_token_update_interval_mid=float_token_update_interval_mid,
+                    float_token_update_interval_long=float_token_update_interval_long,
+                    use_quality_scorer=use_quality_scorer,
+                    use_kv_bank_v2=use_kv_bank_v2,
+                    layer_idx=layer_idx,
+                    use_dynamic_intervals=use_dynamic_intervals,
+                    use_temporal_coherence=use_temporal_coherence,
+                    use_progressive_activation=use_progressive_activation,
+                    progressive_warmup_frames=progressive_warmup_frames,
+                    coherence_history_size=coherence_history_size,
+                    dynamic_interval_min_factor=dynamic_interval_min_factor,
+                    dynamic_interval_max_factor=dynamic_interval_max_factor
+                )
             )
-            for _ in range(num_layers)
-        ])
+        self.blocks = nn.ModuleList(blocks)
 
         # head
         self.head = CausalHead(dim, out_dim, patch_size, eps)
@@ -1497,6 +1583,21 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             for block in self.blocks:
                 if hasattr(block.self_attn, 'reset_float_bank'):
                     block.self_attn.reset_float_bank()
+    
+    def step_float_banks(self, num_frames: int = 1):
+        """
+        Step float banks for progressive activation.
+        Should be called after processing each frame during inference.
+        
+        Args:
+            num_frames: Number of frames to advance
+        """
+        if self.use_float_tokens:
+            for block in self.blocks:
+                if hasattr(block.self_attn, 'float_kv_bank') and block.self_attn.float_kv_bank is not None:
+                    float_bank = block.self_attn.float_kv_bank
+                    if hasattr(float_bank, 'step'):
+                        float_bank.step(num_frames)
 
     def init_weights(self):
         r"""

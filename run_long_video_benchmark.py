@@ -175,8 +175,35 @@ def create_config(mode: str):
         print("  - Local attention: ENABLED (local_attn_size=21)")
         print("  - Float tokens: ENABLED (V2, layers 10-19 only)")
         print("=" * 80)
+    elif mode == "aft":
+        # Adaptive Float Tokens with all new features
+        model_kwargs = {
+            "timestep_shift": 5.0,
+            "local_attn_size": 21,  # Sliding window of 21 frames
+            "use_float_tokens": True,
+            "use_kv_bank_v2": True,
+            "use_hierarchical_float_tokens": True,
+            "use_layer_adaptive_float_tokens": True,
+            "layer_config_preset": "memory_efficient",
+            "use_dynamic_intervals": True,
+            "use_temporal_coherence": True,
+            "use_progressive_activation": True,
+            "progressive_warmup_frames": 300,
+            "float_token_num_slots_short": 4,
+            "float_token_num_slots_mid": 4,
+            "float_token_num_slots_long": 4,
+        }
+        print("=" * 80)
+        print("Mode: AFT (Adaptive Float Tokens)")
+        print("  - Local attention: ENABLED (local_attn_size=21)")
+        print("  - Float tokens: ENABLED (V2)")
+        print("  - Layer-adaptive config: ENABLED")
+        print("  - Dynamic intervals: ENABLED")
+        print("  - Temporal coherence: ENABLED")
+        print("  - Progressive activation: ENABLED")
+        print("=" * 80)
     else:
-        raise ValueError(f"Unknown mode: {mode}. Must be 'baseline', 'float_v2', 'float_v2_sink', or 'float_v2_midlayers'")
+        raise ValueError(f"Unknown mode: {mode}. Must be 'baseline', 'float_v2', 'float_v2_sink', 'float_v2_midlayers', 'float_v2_shortonly', or 'aft'")
     
     base_config["model_kwargs"] = model_kwargs
     config = OmegaConf.create(base_config)
@@ -191,8 +218,8 @@ def main():
         "--mode",
         type=str,
         required=True,
-        choices=["baseline", "float_v2", "float_v2_sink", "float_v2_midlayers", "float_v2_shortonly"],
-        help="Inference mode: baseline, float_v2, float_v2_sink, float_v2_midlayers, or float_v2_shortonly"
+        choices=["baseline", "float_v2", "float_v2_sink", "float_v2_midlayers", "float_v2_shortonly", "aft"],
+        help="Inference mode: baseline, float_v2, float_v2_sink, float_v2_midlayers, float_v2_shortonly, or aft"
     )
     parser.add_argument(
         "--output_dir",
