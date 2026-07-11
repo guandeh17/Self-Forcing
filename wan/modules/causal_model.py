@@ -1,4 +1,8 @@
 from wan.modules.attention import attention
+from wan.modules.nki_attention import (
+    can_use_nki_attention_output_projection,
+    nki_attention_output_projection,
+)
 from wan.modules.model import (
     WanRMSNorm,
     rope_apply,
@@ -114,6 +118,7 @@ class CausalWanSelfAttention(nn.Module):
             return q, k, v
 
         q, k, v = qkv_fn(x)
+        output_projected = False
 
         if kv_cache is None:
             # if it is teacher forcing training?
@@ -226,17 +231,22 @@ class CausalWanSelfAttention(nn.Module):
                 local_start_index = local_end_index - num_new_tokens
                 kv_cache["k"][:, local_start_index:local_end_index] = roped_key
                 kv_cache["v"][:, local_start_index:local_end_index] = v
-            x = attention(
-                roped_query,
-                kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
-                kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
-            )
+            cached_k = kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+            cached_v = kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+            if can_use_nki_attention_output_projection(
+                    roped_query, cached_k, cached_v, self.o.weight, self.o.bias):
+                x = nki_attention_output_projection(
+                    roped_query, cached_k, cached_v, self.o.weight, self.o.bias)
+                output_projected = True
+            else:
+                x = attention(roped_query, cached_k, cached_v)
             kv_cache["global_end_index"].fill_(current_end)
             kv_cache["local_end_index"].fill_(local_end_index)
 
         # output
-        x = x.flatten(2)
-        x = self.o(x)
+        if not output_projected:
+            x = x.flatten(2)
+            x = self.o(x)
         return x
 
 
