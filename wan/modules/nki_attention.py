@@ -21,6 +21,8 @@ _NKI_ATTENTION_OP: Callable[..., torch.Tensor] | None = None
 _NKI_ATTENTION_ERROR: BaseException | None = None
 _NKI_ATTENTION_OUTPUT_PROJECTION_OP: Callable[..., torch.Tensor] | None = None
 _NKI_ATTENTION_OUTPUT_PROJECTION_ERROR: BaseException | None = None
+_NKI_ATTENTION_CTE_KERNEL: Callable[..., Any] | None = None
+_NKI_OUTPUT_PROJECTION_CTE_KERNEL: Callable[..., Any] | None = None
 _NKI_PROJECTION_WEIGHT_CACHE: dict[int, tuple[torch.Tensor, int, torch.Tensor]] = {}
 _NKI_QUERY_TILE = 128
 
@@ -116,8 +118,29 @@ def _load_nki_attention_op() -> Callable[..., torch.Tensor]:
         raise
 
 
+def _attention_output_projection_kernel(q, k, v, weight, bias, scale):
+    attention = _NKI_ATTENTION_CTE_KERNEL(
+        q,
+        k,
+        v,
+        scale=scale,
+        causal_mask=False,
+        tp_q=True,
+        tp_k=True,
+        tp_out=True,
+        cache_softmax=False,
+    )
+    return _NKI_OUTPUT_PROJECTION_CTE_KERNEL(
+        attention.reshape((1, q.shape[0], q.shape[2], q.shape[1])),
+        weight,
+        bias,
+    )
+
+
 def _load_nki_attention_output_projection_op() -> Callable[..., torch.Tensor]:
+    global _NKI_ATTENTION_CTE_KERNEL
     global _NKI_ATTENTION_OUTPUT_PROJECTION_ERROR, _NKI_ATTENTION_OUTPUT_PROJECTION_OP
+    global _NKI_OUTPUT_PROJECTION_CTE_KERNEL
     if _NKI_ATTENTION_OUTPUT_PROJECTION_OP is not None:
         return _NKI_ATTENTION_OUTPUT_PROJECTION_OP
     if _NKI_ATTENTION_OUTPUT_PROJECTION_ERROR is not None:
@@ -134,26 +157,9 @@ def _load_nki_attention_output_projection_op() -> Callable[..., torch.Tensor]:
         from torch_neuronx import nki_op, wrap_nki
         from torch_neuronx.utils import get_logical_neuron_cores
 
-        @nki.jit
-        def attention_output_projection_kernel(q, k, v, weight, bias, scale):
-            attention = attention_cte(
-                q,
-                k,
-                v,
-                scale=scale,
-                causal_mask=False,
-                tp_q=True,
-                tp_k=True,
-                tp_out=True,
-                cache_softmax=False,
-            )
-            return output_projection_cte(
-                attention.reshape((1, q.shape[0], q.shape[2], q.shape[1])),
-                weight,
-                bias,
-            )
-
-        wrapped = wrap_nki(attention_output_projection_kernel)
+        _NKI_ATTENTION_CTE_KERNEL = attention_cte
+        _NKI_OUTPUT_PROJECTION_CTE_KERNEL = output_projection_cte
+        wrapped = wrap_nki(nki.jit(_attention_output_projection_kernel))
 
         @nki_op("self_forcing::attention_output_projection_cte_v1", mutates_args={})
         def attention_output_projection_op(
@@ -274,6 +280,27 @@ def _projection_weight_for_nki(weight: torch.Tensor) -> torch.Tensor:
 
 
 @torch.compiler.disable
+def _invoke_nki_attention_output_projection_isolated(
+    op: Callable[..., torch.Tensor],
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Keep only the opaque NKI call out of the surrounding Wan graph."""
+
+    return op(
+        q,
+        k,
+        v,
+        _projection_weight_for_nki(weight),
+        bias.unsqueeze(0).contiguous(),
+        scale,
+    )
+
+
 def nki_attention_output_projection(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -301,14 +328,25 @@ def nki_attention_output_projection(
         )
 
     op = kernel or _load_nki_attention_output_projection_op()
-    out = op(
-        q_nki,
-        k_nki,
-        v_nki,
-        _projection_weight_for_nki(weight),
-        bias.reshape(1, -1).contiguous(),
-        scale,
-    )
+    if kernel is None and _env_flag("SELF_FORCING_NKI_ATTENTION_ISOLATE_OP", "1"):
+        out = _invoke_nki_attention_output_projection_isolated(
+            op,
+            q_nki,
+            k_nki,
+            v_nki,
+            weight,
+            bias,
+            scale,
+        )
+    else:
+        out = op(
+            q_nki,
+            k_nki,
+            v_nki,
+            _projection_weight_for_nki(weight),
+            bias.unsqueeze(0).contiguous(),
+            scale,
+        )
     return out[:, :q_len].to(q.dtype).reshape(batch, q_len, heads * head_dim)
 
 

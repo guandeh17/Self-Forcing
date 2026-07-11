@@ -170,6 +170,31 @@ def test_fused_attention_projection_pads_query_and_transposes_linear_weight() ->
     assert seen[0][3] == (1, 16)
 
 
+def test_fused_compiled_layout_can_isolate_only_the_opaque_op(monkeypatch) -> None:
+    monkeypatch.setenv("SELF_FORCING_NKI_ATTENTION_ISOLATE_OP", "1")
+    monkeypatch.setattr(
+        NKI_ATTENTION,
+        "_load_nki_attention_output_projection_op",
+        lambda: _torch_attention_output_projection,
+    )
+    torch.manual_seed(10)
+    q = torch.randn(1, 13, 2, 8)
+    k = torch.randn(1, 17, 2, 8)
+    v = torch.randn_like(k)
+    weight = torch.randn(16, 16)
+    bias = torch.randn(16)
+
+    compiled = torch.compile(
+        nki_attention_output_projection, backend="eager", fullgraph=False
+    )
+    actual = compiled(q, k, v, weight, bias)
+    expected = nki_attention_output_projection(
+        q, k, v, weight, bias, kernel=_torch_attention_output_projection
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
 def test_resident_shape_selects_fused_attention_output_projection(monkeypatch) -> None:
     monkeypatch.setenv("SELF_FORCING_NKI_ATTENTION", "1")
     q = torch.empty(1, 4680, 12, 128, dtype=torch.bfloat16)
