@@ -180,7 +180,7 @@ def attention(
                 else nki_attention
             )
             return nki_impl(q, k, v, softmax_scale=softmax_scale)
-        except BaseException:
+        except Exception:
             if _nki_attention_strict():
                 raise
             warnings.warn(

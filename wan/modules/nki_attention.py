@@ -102,7 +102,7 @@ def _load_nki_attention_op() -> Callable[..., torch.Tensor]:
 
         _NKI_ATTENTION_OP = attention_cte_op
         return attention_cte_op
-    except BaseException as exc:
+    except Exception as exc:
         _NKI_ATTENTION_ERROR = exc
         raise
 
