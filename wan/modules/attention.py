@@ -1,4 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import os
+
 import torch
 
 try:
@@ -22,6 +24,12 @@ except ModuleNotFoundError:
 # FLASH_ATTN_3_AVAILABLE = False
 
 import warnings
+
+from wan.modules.nki_attention import (
+    can_use_nki_attention,
+    nki_attention,
+    nki_attention_isolated,
+)
 
 __all__ = [
     'flash_attention',
@@ -151,6 +159,35 @@ def attention(
     dtype=torch.bfloat16,
     fa_version=None,
 ):
+    if q_scale is not None:
+        q = q * q_scale
+
+    if can_use_nki_attention(
+        q,
+        k,
+        v,
+        q_lens=q_lens,
+        k_lens=k_lens,
+        dropout_p=dropout_p,
+        causal=causal,
+        window_size=window_size,
+    ):
+        try:
+            nki_impl = (
+                nki_attention_isolated
+                if os.environ.get("SELF_FORCING_NKI_ISOLATE_OP", "1").strip().lower()
+                in {"1", "true", "yes", "on"}
+                else nki_attention
+            )
+            return nki_impl(q, k, v, softmax_scale=softmax_scale)
+        except BaseException:
+            if _nki_attention_strict():
+                raise
+            warnings.warn(
+                "Self-Forcing NKI attention_cte failed; falling back to PyTorch SDPA.",
+                stacklevel=2,
+            )
+
     if FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE:
         return flash_attention(
             q=q,
@@ -160,7 +197,7 @@ def attention(
             k_lens=k_lens,
             dropout_p=dropout_p,
             softmax_scale=softmax_scale,
-            q_scale=q_scale,
+            q_scale=None,
             causal=causal,
             window_size=window_size,
             deterministic=deterministic,
@@ -183,3 +220,12 @@ def attention(
 
         out = out.transpose(1, 2).contiguous()
         return out
+
+
+def _nki_attention_strict():
+    return os.environ.get("SELF_FORCING_NKI_ATTENTION_STRICT", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
