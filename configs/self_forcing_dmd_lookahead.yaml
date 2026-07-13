@@ -1,0 +1,75 @@
+generator_ckpt: checkpoints/ode_init.pt
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+real_name: Wan2.1-T2V-14B
+text_encoder_fsdp_wrap_strategy: size
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true # need to remove - 0 in denoising_step_list if warp_denoising_step is true
+ts_schedule: false
+num_train_timestep: 1000
+timestep_shift: 5.0
+guidance_scale: 3.0
+denoising_loss_type: flow
+mixed_precision: true
+seed: 0
+wandb_host: WANDB_HOST
+wandb_key: WANDB_KEY
+wandb_entity: WANDB_ENTITY
+wandb_project: WANDB_PROJECT
+sharding_strategy: hybrid_full
+lr: 2.0e-06
+lr_critic: 4.0e-07
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+data_path: prompts/vidprom_filtered_extended.txt
+batch_size: 1
+ema_weight: 0.99
+ema_start_step: 200
+total_batch_size: 64
+log_iters: 50
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+dfake_gen_update_ratio: 5
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+distribution_loss: dmd
+trainer: score_distillation
+gradient_checkpointing: true
+num_frame_per_block: 3
+load_raw_video: false
+model_kwargs:
+  timestep_shift: 5.0
+# ---------------------------------------------------------------------------
+# Lookahead Forcing (mtp.md). Pinned explicitly (do not inherit silently):
+# flipping same_step_across_blocks changes DMD/critic timestep sampling when
+# ts_schedule is on (ts_schedule: false is set above).
+same_step_across_blocks: true
+lookahead:
+  enabled: true
+  variant: fm_selftarget        # fm_selftarget (B) | seed_draft (A)
+  depths: 1                     # K
+  loss_weights: [0.5]           # w_k, length K
+  # lambda: grad-norm-ratio controller state, not a fixed value
+  lambda_init: 0.25
+  grad_ratio_target: [0.10, 0.25]
+  grad_ratio_interval: 100      # generator steps between controller updates
+  lambda_warmup_steps: 1500
+  tap_sources: [exit, context]  # Tap A (grad) and/or Tap B (detached)
+  head_num_blocks: 2
+  head_init_from_backbone: true
+  head_lr: null                 # null = generator lr
+  head_updates_on_critic_steps: true
+  fusion_layers: [8, 16, 24, 30]
+  head_timestep_shift: 10.0     # variant B only
+  record_interstep_noise: true  # variant A conditioning (zeta draws)
+  max_pairs_per_rollout: 6      # upfront tapped-block subset; 6 = all pairs at 7 blocks
