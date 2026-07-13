@@ -283,19 +283,20 @@ class LookaheadModule(nn.Module):
     def compute_losses(
         self,
         model,                       # backbone CausalWanModel (for embeddings/freqs)
-        records: List[dict],         # per-block tap records from the pipeline
+        taps: List[dict],            # per-block tap records from the pipeline
+        block_meta: Dict[int, dict],  # {block_index: {start_frame, seed, zetas}}
         output: torch.Tensor,        # pre-slice rollout output [B, F_total, C, H, W]
         conditional_dict: dict,
         latent_grid: tuple,          # (frames_per_block, H_patches, W_patches)
     ) -> Dict[str, torch.Tensor]:
         """
-        records entries:
+        taps entries:
           {block_index, start_frame, source: 'exit'|'context',
-           tap_timestep: int, feats: {layer: [B, L, C]},
-           seed: [B, F, C, H, W] or None,        # of THIS block (unused here)
-           zetas: list of [B, F, C, H, W]}       # of THIS block
-        Records are keyed by absolute block index; targets are read from the
-        raw pre-slice `output` (mtp.md section 5).
+           tap_timestep: int, feats: {layer: [B, L, C]}}
+        block_meta holds each block's seed noise and recorded inter-step
+        re-noising draws (variant A conditioning), independent of the tap
+        subset. Records are keyed by absolute block index; targets are read
+        from the raw pre-slice `output` (mtp.md section 5).
         """
         device = output.device
         dtype = output.dtype
@@ -308,7 +309,7 @@ class LookaheadModule(nn.Module):
             model.freqs = model.freqs.to(device)
 
         by_block = {}
-        for rec in records:
+        for rec in taps:
             by_block.setdefault(rec["block_index"], {})[rec["source"]] = rec
 
         losses = {}
@@ -333,8 +334,7 @@ class LookaheadModule(nn.Module):
                     if use_seed_draft:
                         # Variant A: one-step x0 draft from the future block's
                         # seed + recorded inter-step draws
-                        target_rec = by_block.get(b + k, {}).get(source) or \
-                            next(iter(by_block.get(b + k, {}).values()), None)
+                        target_rec = block_meta.get(b + k)
                         if target_rec is None or target_rec.get("seed") is None:
                             continue
                         target_tokens = self._patchify(model, target_rec["seed"].to(dtype))

@@ -16,6 +16,7 @@ class SelfForcingTrainingPipeline:
                  last_step_only: bool = False,
                  num_max_frames: int = 21,
                  context_noise: int = 0,
+                 lookahead_config=None,
                  **kwargs):
         super().__init__()
         self.scheduler = scheduler
@@ -37,6 +38,32 @@ class SelfForcingTrainingPipeline:
         self.same_step_across_blocks = same_step_across_blocks
         self.last_step_only = last_step_only
         self.kv_cache_size = num_max_frames * self.frame_seq_length
+
+        # Lookahead Forcing (mtp.md): feature-tap collection during rollout
+        self.lookahead_enabled = bool(lookahead_config and lookahead_config.get("enabled", False))
+        if self.lookahead_enabled:
+            self.lookahead_layers = list(lookahead_config.get("fusion_layers", [8, 16, 24, 30]))
+            self.lookahead_tap_sources = list(lookahead_config.get("tap_sources", ["exit", "context"]))
+            self.lookahead_max_pairs = lookahead_config.get("max_pairs_per_rollout", 6)
+            self.lookahead_record_noise = lookahead_config.get("record_interstep_noise", True)
+        # Populated by inference_with_trajectory when lookahead is enabled;
+        # read by the model after the rollout returns (keyed by absolute
+        # block index, on the pre-slice output — see mtp.md section 5).
+        self.lookahead_taps = None
+        self.lookahead_block_meta = None
+
+    def _sync_tapped_blocks(self, eligible, device):
+        """Choose the tapped-block subset upfront, identically on all ranks."""
+        if len(eligible) <= self.lookahead_max_pairs:
+            return set(eligible)
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0:
+            perm = torch.randperm(len(eligible), device=device)
+        else:
+            perm = torch.empty(len(eligible), dtype=torch.long, device=device)
+        if dist.is_initialized():
+            dist.broadcast(perm, src=0)
+        return set(eligible[i] for i in perm[:self.lookahead_max_pairs].tolist())
 
     def generate_and_sync_list(self, num_blocks, num_denoising_steps, device):
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -136,10 +163,27 @@ class SelfForcingTrainingPipeline:
         exit_flags = self.generate_and_sync_list(len(all_num_frames), num_denoising_steps, device=noise.device)
         start_gradient_frame_index = num_output_frames - 21
 
+        # Lookahead: choose the tapped-block subset upfront (synced across
+        # ranks); the last block has no future target so is never tapped.
+        lookahead_taps = []
+        lookahead_block_meta = {}
+        tapped_blocks = set()
+        if self.lookahead_enabled:
+            eligible = [i for i in range(len(all_num_frames) - 1)
+                        if all_num_frames[i] == self.num_frame_per_block]
+            tapped_blocks = self._sync_tapped_blocks(eligible, noise.device)
+
         # for block_index in range(num_blocks):
         for block_index, current_num_frames in enumerate(all_num_frames):
             noisy_input = noise[
                 :, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
+
+            if self.lookahead_enabled:
+                lookahead_block_meta[block_index] = {
+                    "start_frame": current_start_frame,
+                    "seed": noisy_input if self.lookahead_record_noise else None,
+                    "zetas": [],
+                }
 
             # Step 3.1: Spatial denoising loop
             for index, current_timestep in enumerate(self.denoising_step_list):
@@ -163,12 +207,18 @@ class SelfForcingTrainingPipeline:
                             current_start=current_start_frame * self.frame_seq_length
                         )
                         next_timestep = self.denoising_step_list[index + 1]
+                        # materialize the re-noising draw so variant A can
+                        # condition on it (same RNG stream as randn_like inline)
+                        zeta = torch.randn_like(denoised_pred.flatten(0, 1))
                         noisy_input = self.scheduler.add_noise(
                             denoised_pred.flatten(0, 1),
-                            torch.randn_like(denoised_pred.flatten(0, 1)),
+                            zeta,
                             next_timestep * torch.ones(
                                 [batch_size * current_num_frames], device=noise.device, dtype=torch.long)
                         ).unflatten(0, denoised_pred.shape[:2])
+                        if self.lookahead_enabled and self.lookahead_record_noise:
+                            lookahead_block_meta[block_index]["zetas"].append(
+                                zeta.unflatten(0, denoised_pred.shape[:2]))
                 else:
                     # for getting real output
                     # with torch.set_grad_enabled(current_start_frame >= start_gradient_frame_index):
@@ -183,14 +233,37 @@ class SelfForcingTrainingPipeline:
                                 current_start=current_start_frame * self.frame_seq_length
                             )
                     else:
-                        _, denoised_pred = self.generator(
-                            noisy_image_or_video=noisy_input,
-                            conditional_dict=conditional_dict,
-                            timestep=timestep,
-                            kv_cache=self.kv_cache1,
-                            crossattn_cache=self.crossattn_cache,
-                            current_start=current_start_frame * self.frame_seq_length
-                        )
+                        # Tap A ("exit"): graded features for the regularizer
+                        # channel — gradient reaches the backbone via h_fuse
+                        tap_exit = (self.lookahead_enabled
+                                    and "exit" in self.lookahead_tap_sources
+                                    and block_index in tapped_blocks)
+                        if tap_exit:
+                            _, denoised_pred, feats = self.generator(
+                                noisy_image_or_video=noisy_input,
+                                conditional_dict=conditional_dict,
+                                timestep=timestep,
+                                kv_cache=self.kv_cache1,
+                                crossattn_cache=self.crossattn_cache,
+                                current_start=current_start_frame * self.frame_seq_length,
+                                return_hidden_layers=self.lookahead_layers
+                            )
+                            lookahead_taps.append({
+                                "block_index": block_index,
+                                "start_frame": current_start_frame,
+                                "source": "exit",
+                                "tap_timestep": int(current_timestep),
+                                "feats": feats,
+                            })
+                        else:
+                            _, denoised_pred = self.generator(
+                                noisy_image_or_video=noisy_input,
+                                conditional_dict=conditional_dict,
+                                timestep=timestep,
+                                kv_cache=self.kv_cache1,
+                                crossattn_cache=self.crossattn_cache,
+                                current_start=current_start_frame * self.frame_seq_length
+                            )
                     break
 
             # Step 3.2: record the model's output
@@ -205,18 +278,47 @@ class SelfForcingTrainingPipeline:
                 context_timestep * torch.ones(
                     [batch_size * current_num_frames], device=noise.device, dtype=torch.long)
             ).unflatten(0, denoised_pred.shape[:2])
+            # Tap B ("context"): detached features for the drafter channel;
+            # this pass exists identically at inference (mtp.md section 3)
+            tap_context = (self.lookahead_enabled
+                           and "context" in self.lookahead_tap_sources
+                           and block_index in tapped_blocks)
             with torch.no_grad():
-                self.generator(
-                    noisy_image_or_video=denoised_pred,
-                    conditional_dict=conditional_dict,
-                    timestep=context_timestep,
-                    kv_cache=self.kv_cache1,
-                    crossattn_cache=self.crossattn_cache,
-                    current_start=current_start_frame * self.frame_seq_length
-                )
+                if tap_context:
+                    _, _, feats = self.generator(
+                        noisy_image_or_video=denoised_pred,
+                        conditional_dict=conditional_dict,
+                        timestep=context_timestep,
+                        kv_cache=self.kv_cache1,
+                        crossattn_cache=self.crossattn_cache,
+                        current_start=current_start_frame * self.frame_seq_length,
+                        return_hidden_layers=self.lookahead_layers
+                    )
+                    lookahead_taps.append({
+                        "block_index": block_index,
+                        "start_frame": current_start_frame,
+                        "source": "context",
+                        "tap_timestep": int(self.context_noise),
+                        "feats": {layer: f.detach() for layer, f in feats.items()},
+                    })
+                else:
+                    self.generator(
+                        noisy_image_or_video=denoised_pred,
+                        conditional_dict=conditional_dict,
+                        timestep=context_timestep,
+                        kv_cache=self.kv_cache1,
+                        crossattn_cache=self.crossattn_cache,
+                        current_start=current_start_frame * self.frame_seq_length
+                    )
 
             # Step 3.4: update the start and end frame indices
             current_start_frame += current_num_frames
+
+        # Expose lookahead records to the caller (read after the rollout
+        # returns; keyed by absolute block index on the pre-slice output)
+        if self.lookahead_enabled:
+            self.lookahead_taps = lookahead_taps
+            self.lookahead_block_meta = lookahead_block_meta
 
         # Step 3.5: Return the denoised timestep
         if not self.same_step_across_blocks:
