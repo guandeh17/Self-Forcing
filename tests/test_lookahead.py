@@ -344,6 +344,35 @@ def test_11_zero_init_noop():
     print("test_11_zero_init_noop PASSED")
 
 
+def test_12_grounding_drafts():
+    """C1: grounding=dmd_on_drafts exposes clean drafts of future blocks whose
+    gradient reaches the backbone; no drafts when features are detached."""
+    cfg = dict(LOOKAHEAD_CFG, grounding="dmd_on_drafts")
+    gen, pipe = build_pipeline(seed=0, lookahead=True)
+
+    # generator-step rollout (features carry grad)
+    out, _, _, cond = rollout(pipe, seed=1)
+    la = LookaheadModule(cfg, gen.model, num_denoising_steps=len(DENOISING_STEPS),
+                         num_frame_per_block=3).to(device=DEVICE, dtype=DTYPE)
+    losses = compute_lsc(la, pipe, out, cond)
+    drafts = losses.pop("_drafts", None)
+    assert drafts is not None and len(drafts) > 0, "no drafts with grounding on"
+    d = drafts[0]
+    assert d["draft"].shape == (1, 3, 16, LATENT_H, LATENT_W)
+    gen.zero_grad(set_to_none=True)
+    d["draft"].float().pow(2).mean().backward()
+    backbone_grad = sum(p.grad.float().abs().sum().item()
+                        for p in gen.model.parameters() if p.grad is not None)
+    assert backbone_grad > 0.0, "draft gradient did not reach backbone"
+
+    # critic-step-style rollout (no_grad => detached features => no drafts)
+    with torch.no_grad():
+        out2, _, _, cond2 = rollout(pipe, seed=2)
+    losses2 = compute_lsc(la, pipe, out2, cond2)
+    assert "_drafts" not in losses2, "drafts produced from detached features"
+    print("test_12_grounding_drafts PASSED")
+
+
 if __name__ == "__main__":
     tests = [
         test_1_rope_offset,
@@ -356,6 +385,7 @@ if __name__ == "__main__":
         test_9_pairing_arithmetic,
         test_10_seed_draft_variant,
         test_11_zero_init_noop,
+        test_12_grounding_drafts,
     ]
     failed = []
     for t in tests:

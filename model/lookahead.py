@@ -210,6 +210,7 @@ class LookaheadModule(nn.Module):
         super().__init__()
         la = lookahead_cfg
         self.variant = la.get("variant", "fm_selftarget")
+        self.grounding = la.get("grounding", "none")
         self.depths = int(la.get("depths", 1))
         self.loss_weights = list(la.get("loss_weights", [0.5]))
         self.fusion_layers = list(la.get("fusion_layers", [8, 16, 24, 30]))
@@ -342,6 +343,7 @@ class LookaheadModule(nn.Module):
 
         losses = {}
         counts = {}
+        drafts = []
         for k in range(1, self.depths + 1):
             head = self.heads[k - 1]
             w_k = self.loss_weights[k - 1]
@@ -405,8 +407,27 @@ class LookaheadModule(nn.Module):
                     losses[key] = losses.get(key, 0.0) + w_k * loss
                     counts[key] = counts.get(key, 0) + 1
 
+                    # C1 grounding (mtp.md section 4): expose a clean draft of
+                    # the future block, differentiable through h_fuse, so the
+                    # caller can apply the DMD teacher gradient to it. Only
+                    # useful when the features carry grad (generator steps,
+                    # exit tap).
+                    if (self.grounding == "dmd_on_drafts" and k == 1
+                            and source == "exit" and h_fuse.requires_grad):
+                        if use_seed_draft:
+                            draft = pred
+                        else:
+                            # flow param: x0 = x_t - sigma * v
+                            draft = x_t.float() - sigma_.float() * pred.float()
+                        drafts.append({
+                            "start_frame": target_start_frame,
+                            "draft": draft,
+                        })
+
         for key in losses:
             losses[key] = losses[key] / counts[key]
+        if drafts:
+            losses["_drafts"] = drafts
         return losses
 
     def _unpatchify(self, x, f, hp, wp):

@@ -57,6 +57,10 @@ same_step_across_blocks: true
 lookahead:
   enabled: true
   variant: fm_selftarget        # fm_selftarget (B) | seed_draft (A)
+  # C1 grounding: apply the DMD teacher gradient to a drafted future block
+  # (through h_fuse -> backbone). Primary backbone-improving signal.
+  grounding: dmd_on_drafts      # none | dmd_on_drafts
+  grounding_weight: 1.0
   depths: 1                     # K
   loss_weights: [0.5]           # w_k, length K
   # lambda: grad-norm-ratio controller state, not a fixed value

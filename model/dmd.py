@@ -39,6 +39,7 @@ class DMD(SelfForcingModel):
             )
             self.lookahead_head_updates_on_critic_steps = lookahead_cfg.get(
                 "head_updates_on_critic_steps", True)
+            self.lookahead_grounding_weight = float(lookahead_cfg.get("grounding_weight", 1.0))
         self._lookahead_ctx = None
 
         # this will be init later with fsdp-wrapped modules
@@ -249,11 +250,75 @@ class DMD(SelfForcingModel):
         # "lookahead_losses"; the trainer composes the total (lambda-weighted
         # exit terms + drafter terms) and runs the grad-ratio controller.
         if self.lookahead_enabled and self._lookahead_ctx is not None:
-            dmd_log_dict["lookahead_losses"] = self.generator(
+            rollout_total_frames = self._lookahead_ctx["output"].shape[1]
+            lookahead_losses = self.generator(
                 lookahead_inputs=self._lookahead_ctx)
             self._lookahead_ctx = None
 
+            # C1 grounding: apply the DMD teacher gradient to one drafted
+            # future block (differentiable through h_fuse -> backbone). This
+            # is the channel that injects teacher information about futures —
+            # the primary backbone-improving signal (mtp.md section 4).
+            drafts = lookahead_losses.pop("_drafts", None)
+            if drafts:
+                grounding_loss = self._compute_draft_grounding_loss(
+                    drafts=drafts,
+                    pred_image=pred_image,
+                    conditional_dict=conditional_dict,
+                    unconditional_dict=unconditional_dict,
+                    denoised_timestep_from=denoised_timestep_from,
+                    denoised_timestep_to=denoised_timestep_to,
+                    rollout_total_frames=rollout_total_frames,
+                )
+                if grounding_loss is not None:
+                    # "_exit" suffix -> joins the lambda-scaled backbone channel
+                    lookahead_losses["lookahead_dmddraft_exit"] = grounding_loss
+            dmd_log_dict["lookahead_losses"] = lookahead_losses
+
         return dmd_loss, dmd_log_dict
+
+    def _compute_draft_grounding_loss(
+        self,
+        drafts: list,
+        pred_image: torch.Tensor,
+        conditional_dict: dict,
+        unconditional_dict: dict,
+        denoised_timestep_from: int,
+        denoised_timestep_to: int,
+        rollout_total_frames: int,
+    ) -> Optional[torch.Tensor]:
+        """
+        Splice one drafted block into the (detached) rollout window and run the
+        standard DMD loss with a gradient mask on the draft slice — the critic
+        stays in-distribution (full window) while gradient flows only through
+        the draft.
+        """
+        # pred_image is the last-N slice of the rollout output; map absolute
+        # frame indices into slice coordinates
+        offset = rollout_total_frames - pred_image.shape[1]
+        valid = [d for d in drafts
+                 if d["start_frame"] - offset >= 0
+                 and d["start_frame"] - offset + d["draft"].shape[1] <= pred_image.shape[1]]
+        if len(valid) == 0:
+            return None
+        pick = valid[int(torch.randint(len(valid), (1,)).item())]
+        start = pick["start_frame"] - offset
+        draft = pick["draft"].to(pred_image.dtype)
+
+        hybrid = pred_image.detach().clone()
+        hybrid[:, start:start + draft.shape[1]] = draft
+        gradient_mask = torch.zeros_like(hybrid, dtype=torch.bool)
+        gradient_mask[:, start:start + draft.shape[1]] = True
+
+        grounding_loss, _ = self.compute_distribution_matching_loss(
+            image_or_video=hybrid,
+            conditional_dict=conditional_dict,
+            unconditional_dict=unconditional_dict,
+            gradient_mask=gradient_mask,
+            denoised_timestep_from=denoised_timestep_from,
+            denoised_timestep_to=denoised_timestep_to,
+        )
+        return grounding_loss * self.lookahead_grounding_weight
 
     def critic_loss(
         self,
@@ -294,6 +359,8 @@ class DMD(SelfForcingModel):
             if self.lookahead_head_updates_on_critic_steps:
                 critic_lookahead_losses = self.generator(
                     lookahead_inputs=self._lookahead_ctx)
+                # no grounding on critic steps (features are detached)
+                critic_lookahead_losses.pop("_drafts", None)
             self._lookahead_ctx = None
 
         # Step 2: Compute the fake prediction
