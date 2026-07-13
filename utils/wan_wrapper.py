@@ -225,7 +225,8 @@ class WanDiffusionWrapper(torch.nn.Module):
         concat_time_embeddings: Optional[bool] = False,
         clean_x: Optional[torch.Tensor] = None,
         aug_t: Optional[torch.Tensor] = None,
-        cache_start: Optional[int] = None
+        cache_start: Optional[int] = None,
+        return_hidden_layers: Optional[List[int]] = None
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
 
@@ -236,7 +237,8 @@ class WanDiffusionWrapper(torch.nn.Module):
             input_timestep = timestep
 
         logits = None
-        # X0 prediction
+        hidden_states = None
+        # Velocity (flow) prediction; x0 is derived below
         if kv_cache is not None:
             flow_pred = self.model(
                 noisy_image_or_video.permute(0, 2, 1, 3, 4),
@@ -245,9 +247,16 @@ class WanDiffusionWrapper(torch.nn.Module):
                 kv_cache=kv_cache,
                 crossattn_cache=crossattn_cache,
                 current_start=current_start,
-                cache_start=cache_start
-            ).permute(0, 2, 1, 3, 4)
+                cache_start=cache_start,
+                return_hidden_layers=return_hidden_layers
+            )
+            if return_hidden_layers is not None:
+                flow_pred, hidden_states = flow_pred
+            flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
         else:
+            if return_hidden_layers is not None:
+                raise NotImplementedError(
+                    "return_hidden_layers is only supported on the KV-cache (causal inference) path")
             if clean_x is not None:
                 # teacher forcing
                 flow_pred = self.model(
@@ -285,6 +294,9 @@ class WanDiffusionWrapper(torch.nn.Module):
 
         if logits is not None:
             return flow_pred, pred_x0, logits
+
+        if return_hidden_layers is not None:
+            return flow_pred, pred_x0, hidden_states
 
         return flow_pred, pred_x0
 

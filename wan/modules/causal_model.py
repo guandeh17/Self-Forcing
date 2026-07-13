@@ -720,7 +720,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         kv_cache: dict = None,
         crossattn_cache: dict = None,
         current_start: int = 0,
-        cache_start: int = 0
+        cache_start: int = 0,
+        return_hidden_layers=None,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -741,10 +742,17 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 CLIP image features for image-to-video mode
             y (List[Tensor], *optional*):
                 Conditional video inputs for image-to-video mode, same shape as x
+            return_hidden_layers (List[int], *optional*):
+                1-indexed transformer-block indices whose output hidden states
+                ([B, L, C], pre-head) are additionally returned. Collected at
+                checkpoint boundaries, so the tensors stay differentiable under
+                gradient checkpointing at no extra memory cost.
 
         Returns:
             List[Tensor]:
-                List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
+                List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8],
+                or a tuple (output, {layer_index: hidden_states}) when
+                `return_hidden_layers` is given.
         """
 
         if self.model_type == 'i2v':
@@ -809,6 +817,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 return module(*inputs, **kwargs)
             return custom_forward
 
+        hidden_states = {} if return_hidden_layers is not None else None
         for block_index, block in enumerate(self.blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 kwargs.update(
@@ -833,11 +842,18 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     }
                 )
                 x = block(x, **kwargs)
+            # Tap block outputs at the checkpoint boundary (x here is the tensor
+            # returned by checkpoint()/block(), i.e. the next segment's saved
+            # input) so the tap is differentiable and costs no extra memory.
+            if hidden_states is not None and (block_index + 1) in return_hidden_layers:
+                hidden_states[block_index + 1] = x
 
         # head
         x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
+        if hidden_states is not None:
+            return torch.stack(x), hidden_states
         return torch.stack(x)
 
     def _forward_train(
