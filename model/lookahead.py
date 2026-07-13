@@ -16,9 +16,14 @@ Loss variants:
   - fm_selftarget (B): bootstrapped flow matching against the committed block.
   - seed_draft (A):    one-step x0 draft conditioned on the future block's
                        seed noise and the recorded inter-step re-noising draws.
+
+FSDP note: LookaheadModule owns private copies of the patch/time/text
+embeddings (initialized from the backbone) instead of referencing backbone
+submodules, and is invoked through WanDiffusionWrapper.forward so parameters
+are gathered correctly under FSDP.
 """
 import math
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import torch
 import torch.nn as nn
@@ -192,26 +197,50 @@ class LookaheadHead(nn.Module):
 
 class LookaheadModule(nn.Module):
     """
-    Container attached to the generator wrapper: fusion MLP + heads + losses.
-    Holds no reference to the backbone; backbone modules (patch/time/text
-    embedding, freqs, blocks) are passed in at call time so parameters are
-    registered exactly once.
+    Fusion MLP + heads + private embedding copies + losses.
+
+    Attach as a submodule of WanDiffusionWrapper BEFORE FSDP wrapping and
+    invoke through the wrapper's forward (`lookahead_inputs=...`) so FSDP
+    gathers parameters. Holds no reference to backbone modules; embeddings
+    are copied at construction time.
     """
 
-    def __init__(self, args, dim, ffn_dim, num_heads, out_dim, patch_size,
-                 num_denoising_steps):
+    def __init__(self, lookahead_cfg, backbone, num_denoising_steps,
+                 num_frame_per_block=3):
         super().__init__()
-        la = args.lookahead
+        la = lookahead_cfg
         self.variant = la.get("variant", "fm_selftarget")
-        self.depths = la.get("depths", 1)
+        self.depths = int(la.get("depths", 1))
         self.loss_weights = list(la.get("loss_weights", [0.5]))
         self.fusion_layers = list(la.get("fusion_layers", [8, 16, 24, 30]))
-        self.head_timestep_shift = la.get("head_timestep_shift", 10.0)
+        self.head_timestep_shift = float(la.get("head_timestep_shift", 10.0))
         self.tap_sources = list(la.get("tap_sources", ["exit", "context"]))
-        self.num_frame_per_block = args.num_frame_per_block
+        self.num_frame_per_block = num_frame_per_block
+
+        # dims read from the instantiated backbone (NOT class defaults)
+        dim = backbone.dim
         self.dim = dim
-        self.patch_size = patch_size
-        self.out_dim = out_dim
+        self.out_dim = backbone.out_dim
+        self.patch_size = backbone.patch_size
+        self.freq_dim = backbone.freq_dim
+        self.text_len = backbone.text_len
+
+        # private embedding copies (initialized from backbone; gradients from
+        # the lookahead loss reach the backbone only through Tap-A h_fuse)
+        self.patch_embedding = nn.Conv3d(
+            backbone.in_dim, dim, kernel_size=self.patch_size, stride=self.patch_size)
+        self.text_embedding = nn.Sequential(
+            nn.Linear(backbone.text_dim, dim), nn.GELU(approximate='tanh'),
+            nn.Linear(dim, dim))
+        self.time_embedding = nn.Sequential(
+            nn.Linear(self.freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
+        self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
+        self.patch_embedding.load_state_dict(backbone.patch_embedding.state_dict())
+        self.text_embedding.load_state_dict(backbone.text_embedding.state_dict())
+        self.time_embedding.load_state_dict(backbone.time_embedding.state_dict())
+        self.time_projection.load_state_dict(backbone.time_projection.state_dict())
+        # plain attribute, like CausalWanModel.freqs (keeps float64 under .to())
+        self.freqs = backbone.freqs.clone()
 
         self.fusion = nn.Sequential(
             nn.Linear(dim * len(self.fusion_layers), dim),
@@ -219,12 +248,15 @@ class LookaheadModule(nn.Module):
             nn.Linear(dim, dim),
         )
         self.heads = nn.ModuleList([
-            LookaheadHead(dim, ffn_dim, num_heads,
-                          num_blocks=la.get("head_num_blocks", 2),
-                          out_dim=out_dim, patch_size=patch_size,
+            LookaheadHead(dim, backbone.ffn_dim, backbone.num_heads,
+                          num_blocks=int(la.get("head_num_blocks", 2)),
+                          out_dim=self.out_dim, patch_size=self.patch_size,
                           max_zeta_draws=max(num_denoising_steps - 1, 1))
             for _ in range(self.depths)
         ])
+        if la.get("head_init_from_backbone", True):
+            for head in self.heads:
+                head.init_from_backbone(backbone.blocks)
         self._mask_cache = {}
 
     # ---------------------------------------------------------------- masks
@@ -244,29 +276,26 @@ class LookaheadModule(nn.Module):
         return self._mask_cache[key]
 
     # ------------------------------------------------------------- helpers
-    @staticmethod
-    def _patchify(model, latent):
+    def _patchify(self, latent):
         # latent: [B, F, C, H, W] -> tokens [B, F*H'*W', dim]
-        x = model.patch_embedding(latent.permute(0, 2, 1, 3, 4))
+        x = self.patch_embedding(latent.permute(0, 2, 1, 3, 4))
         return x.flatten(2).transpose(1, 2)
 
-    @staticmethod
-    def _text_context(model, prompt_embeds):
-        return model.text_embedding(
+    def _text_context(self, prompt_embeds):
+        return self.text_embedding(
             torch.stack([
-                torch.cat([u, u.new_zeros(model.text_len - u.size(0), u.size(1))])
+                torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
                 for u in prompt_embeds
             ]))
 
-    @staticmethod
-    def _time_embed(model, t_per_frame, ref_dtype):
+    def _time_embed(self, t_per_frame, ref_dtype):
         """
         t_per_frame: [B, F] integer timesteps.
         Returns (e0 [B, F, 6, C], e_out [B, F, 1, C]).
         """
-        e = model.time_embedding(
-            sinusoidal_embedding_1d(model.freq_dim, t_per_frame.flatten()).to(ref_dtype))
-        e0 = model.time_projection(e).unflatten(1, (6, model.dim)).unflatten(0, t_per_frame.shape)
+        e = self.time_embedding(
+            sinusoidal_embedding_1d(self.freq_dim, t_per_frame.flatten()).to(ref_dtype))
+        e0 = self.time_projection(e).unflatten(1, (6, self.dim)).unflatten(0, t_per_frame.shape)
         e_out = e.unflatten(0, t_per_frame.shape).unsqueeze(2)
         return e0, e_out
 
@@ -280,9 +309,8 @@ class LookaheadModule(nn.Module):
         return self.fusion(fused_in)
 
     # --------------------------------------------------------------- losses
-    def compute_losses(
+    def forward(
         self,
-        model,                       # backbone CausalWanModel (for embeddings/freqs)
         taps: List[dict],            # per-block tap records from the pipeline
         block_meta: Dict[int, dict],  # {block_index: {start_frame, seed, zetas}}
         output: torch.Tensor,        # pre-slice rollout output [B, F_total, C, H, W]
@@ -304,9 +332,9 @@ class LookaheadModule(nn.Module):
         fpb, hp, wp = latent_grid
         # one row per sample: causal_rope_apply iterates grid_sizes rows
         grid_sizes = torch.tensor([[fpb, hp, wp]], dtype=torch.long).repeat(batch_size, 1)
-        context = self._text_context(model, conditional_dict["prompt_embeds"])
-        if model.freqs.device != device:
-            model.freqs = model.freqs.to(device)
+        context = self._text_context(conditional_dict["prompt_embeds"])
+        if self.freqs.device != device:
+            self.freqs = self.freqs.to(device)
 
         by_block = {}
         for rec in taps:
@@ -337,10 +365,10 @@ class LookaheadModule(nn.Module):
                         target_rec = block_meta.get(b + k)
                         if target_rec is None or target_rec.get("seed") is None:
                             continue
-                        target_tokens = self._patchify(model, target_rec["seed"].to(dtype))
+                        target_tokens = self._patchify(target_rec["seed"].to(dtype))
                         for i, zeta in enumerate(target_rec.get("zetas", [])):
                             target_tokens = target_tokens + head.zeta_proj[i](
-                                self._patchify(model, zeta.to(dtype)))
+                                self._patchify(zeta.to(dtype)))
                         t_target = torch.full((batch_size, fpb), 1000, device=device, dtype=torch.long)
                         regression_target = x_bar
                     else:
@@ -349,14 +377,14 @@ class LookaheadModule(nn.Module):
                         eps = torch.randn_like(x_bar)
                         sigma_ = sigma.view(-1, 1, 1, 1, 1).to(dtype)
                         x_t = (1 - sigma_) * x_bar + sigma_ * eps
-                        target_tokens = self._patchify(model, x_t)
+                        target_tokens = self._patchify(x_t)
                         t_target = (sigma * 1000).long().unsqueeze(1).expand(-1, fpb)
                         regression_target = eps - x_bar
 
                     t_fuse = torch.full((batch_size, fpb), rec["tap_timestep"],
                                         device=device, dtype=torch.long)
                     e0, e_out = self._time_embed(
-                        model, torch.cat([t_fuse, t_target.to(device)], dim=1), dtype)
+                        torch.cat([t_fuse, t_target.to(device)], dim=1), dtype)
                     e_out = e_out[:, fpb:]
 
                     total_len = h_fuse.shape[1] + target_tokens.shape[1]
@@ -364,7 +392,7 @@ class LookaheadModule(nn.Module):
 
                     pred_tokens = head(
                         target_tokens, h_fuse, e0, e_out, context, grid_sizes,
-                        model.freqs, block_mask,
+                        self.freqs, block_mask,
                         fuse_start_frame=rec["start_frame"],
                         target_start_frame=target_start_frame,
                     )

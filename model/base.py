@@ -151,6 +151,21 @@ class SelfForcingModel(BaseModel):
                               device=self.device, dtype=self.dtype),
             **conditional_dict,
         )
+
+        # Lookahead: stash tap records + the PRE-SLICE output (keyed by
+        # absolute block index; the last-21 slice below would corrupt
+        # feature<->target pairing — mtp.md section 5). Targets are detached.
+        if getattr(self.inference_pipeline, "lookahead_enabled", False) \
+                and self.inference_pipeline.lookahead_taps:
+            self._lookahead_ctx = {
+                "taps": self.inference_pipeline.lookahead_taps,
+                "block_meta": self.inference_pipeline.lookahead_block_meta,
+                "output": pred_image_or_video.detach(),
+                "conditional_dict": {"prompt_embeds": conditional_dict["prompt_embeds"]},
+            }
+        else:
+            self._lookahead_ctx = None
+
         # Slice last 21 frames
         if pred_image_or_video.shape[1] > 21:
             with torch.no_grad():
@@ -218,5 +233,6 @@ class SelfForcingModel(BaseModel):
             same_step_across_blocks=self.args.same_step_across_blocks,
             last_step_only=self.args.last_step_only,
             num_max_frames=self.num_training_frames,
-            context_noise=self.args.context_noise
+            context_noise=self.args.context_noise,
+            lookahead_config=getattr(self.args, "lookahead", None)
         )

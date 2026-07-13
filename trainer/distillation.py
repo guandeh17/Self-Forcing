@@ -103,13 +103,38 @@ class Trainer:
             self.model.vae = self.model.vae.to(
                 device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
 
+        # Lookahead Forcing: head/fusion params live in their own optimizer so
+        # they can also be stepped on critic steps (free drafter data,
+        # mtp.md section 4); the generator optimizer excludes them.
+        lookahead_cfg = getattr(config, "lookahead", None)
+        self.lookahead_enabled = bool(lookahead_cfg and lookahead_cfg.get("enabled", False))
         self.generator_optimizer = torch.optim.AdamW(
-            [param for param in self.model.generator.parameters()
-             if param.requires_grad],
+            [param for name, param in self.model.generator.named_parameters()
+             if param.requires_grad and "lookahead" not in name],
             lr=config.lr,
             betas=(config.beta1, config.beta2),
             weight_decay=config.weight_decay
         )
+
+        self.lookahead_optimizer = None
+        if self.lookahead_enabled:
+            lookahead_params = [
+                param for name, param in self.model.generator.named_parameters()
+                if param.requires_grad and "lookahead" in name]
+            assert len(lookahead_params) > 0, "lookahead enabled but no lookahead params found"
+            self.lookahead_optimizer = torch.optim.AdamW(
+                lookahead_params,
+                lr=lookahead_cfg.get("head_lr", None) or config.lr,
+                betas=(config.beta1, config.beta2),
+                weight_decay=config.weight_decay
+            )
+            # lambda state for the grad-norm-ratio controller (+ warmup)
+            self.lookahead_lambda = float(lookahead_cfg.get("lambda_init", 0.25))
+            self.lookahead_warmup_steps = int(lookahead_cfg.get("lambda_warmup_steps", 1500))
+            ratio_lo, ratio_hi = lookahead_cfg.get("grad_ratio_target", [0.10, 0.25])
+            self.lookahead_ratio_lo, self.lookahead_ratio_hi = float(ratio_lo), float(ratio_hi)
+            self.lookahead_ratio_interval = int(lookahead_cfg.get("grad_ratio_interval", 100))
+            self.lookahead_gen_updates = 0
 
         self.critic_optimizer = torch.optim.AdamW(
             [param for param in self.model.fake_score.parameters()
@@ -165,9 +190,16 @@ class Trainer:
                 state_dict = state_dict["generator"]
             elif "model" in state_dict:
                 state_dict = state_dict["model"]
-            self.model.generator.load_state_dict(
-                state_dict, strict=True
+            # strict=False so a lookahead-augmented generator can load the
+            # released (head-less) checkpoint; assert nothing else is off
+            missing_keys, unexpected_keys = self.model.generator.load_state_dict(
+                state_dict, strict=False
             )
+            assert len(unexpected_keys) == 0, \
+                f"unexpected keys in generator checkpoint: {unexpected_keys}"
+            non_lookahead_missing = [k for k in missing_keys if "lookahead" not in k]
+            assert len(non_lookahead_missing) == 0, \
+                f"missing non-lookahead keys in generator checkpoint: {non_lookahead_missing}"
 
         ##############################################################################################################
 
@@ -178,6 +210,23 @@ class Trainer:
         self.max_grad_norm_generator = getattr(config, "max_grad_norm_generator", 10.0)
         self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
         self.previous_time = None
+
+    def _generator_backbone_grad_norm(self):
+        """Global L2 norm of non-lookahead generator grads (FSDP-sharded)."""
+        sq = torch.zeros(1, device=self.device, dtype=torch.float32)
+        for name, param in self.model.generator.named_parameters():
+            if param.grad is not None and "lookahead" not in name:
+                sq += param.grad.detach().float().pow(2).sum()
+        dist.all_reduce(sq)
+        return sq.sqrt().item()
+
+    def _compose_lookahead_loss(self, lookahead_losses, lam):
+        """Split LSC terms by tap source: exit terms are lambda-weighted (they
+        carry backbone gradient via h_fuse); context terms train heads only."""
+        zero = torch.zeros((), device=self.device)
+        la_exit = sum((v for k, v in lookahead_losses.items() if k.endswith("_exit")), zero)
+        la_context = sum((v for k, v in lookahead_losses.items() if k.endswith("_context")), zero)
+        return la_exit, la_context, lam * la_exit + la_context
 
     def save(self):
         print("Start gathering distributed model states...")
@@ -250,7 +299,46 @@ class Trainer:
                 initial_latent=image_latent if self.config.i2v else None
             )
 
-            generator_loss.backward()
+            lookahead_losses = generator_log_dict.pop("lookahead_losses", None)
+            if lookahead_losses:
+                self.lookahead_gen_updates += 1
+                warmup = min(1.0, self.lookahead_gen_updates / max(self.lookahead_warmup_steps, 1))
+                lam = self.lookahead_lambda * warmup
+                la_exit, la_context, lookahead_total = self._compose_lookahead_loss(
+                    lookahead_losses, lam)
+
+                measure = (
+                    torch.is_tensor(la_exit) and la_exit.requires_grad
+                    and self.lookahead_gen_updates % self.lookahead_ratio_interval == 0
+                )
+                if measure:
+                    # grad-norm-ratio controller (mtp.md section 4): probe the
+                    # backbone grad norms of the two terms separately, adjust
+                    # lambda multiplicatively, then accumulate the true total.
+                    (lam * la_exit).backward(retain_graph=True)
+                    norm_lsc = self._generator_backbone_grad_norm()
+                    self.generator_optimizer.zero_grad(set_to_none=True)
+                    self.lookahead_optimizer.zero_grad(set_to_none=True)
+                    generator_loss.backward(retain_graph=True)
+                    norm_dmd = self._generator_backbone_grad_norm()
+                    lookahead_total.backward()
+                    ratio = norm_lsc / (norm_dmd + 1e-8)
+                    if ratio > self.lookahead_ratio_hi:
+                        self.lookahead_lambda /= 1.5
+                    elif ratio < self.lookahead_ratio_lo:
+                        self.lookahead_lambda *= 1.5
+                    generator_log_dict["lookahead_grad_ratio"] = torch.tensor(ratio)
+                else:
+                    (generator_loss + lookahead_total).backward()
+
+                generator_log_dict.update({
+                    "lookahead_loss_exit": la_exit.detach() if torch.is_tensor(la_exit) else la_exit,
+                    "lookahead_loss_context": la_context.detach() if torch.is_tensor(la_context) else la_context,
+                    "lookahead_lambda": torch.tensor(lam),
+                })
+            else:
+                generator_loss.backward()
+
             generator_grad_norm = self.model.generator.clip_grad_norm_(
                 self.max_grad_norm_generator)
 
@@ -269,6 +357,16 @@ class Trainer:
             clean_latent=clean_latent,
             initial_latent=image_latent if self.config.i2v else None
         )
+
+        # Lookahead: head-only update from the critic-step rollout (features
+        # are detached, so no backbone/critic interference)
+        lookahead_losses = critic_log_dict.pop("lookahead_losses", None)
+        if lookahead_losses:
+            _, _, lookahead_total = self._compose_lookahead_loss(
+                lookahead_losses, self.lookahead_lambda)
+            if torch.is_tensor(lookahead_total) and lookahead_total.requires_grad:
+                lookahead_total.backward()
+                critic_log_dict["lookahead_loss_critic_step"] = lookahead_total.detach()
 
         critic_loss.backward()
         critic_grad_norm = self.model.fake_score.clip_grad_norm_(
@@ -318,23 +416,31 @@ class Trainer:
             # Train the generator
             if TRAIN_GENERATOR:
                 self.generator_optimizer.zero_grad(set_to_none=True)
+                if self.lookahead_optimizer is not None:
+                    self.lookahead_optimizer.zero_grad(set_to_none=True)
                 extras_list = []
                 batch = next(self.dataloader)
                 extra = self.fwdbwd_one_step(batch, True)
                 extras_list.append(extra)
                 generator_log_dict = merge_dict_list(extras_list)
                 self.generator_optimizer.step()
+                if self.lookahead_optimizer is not None:
+                    self.lookahead_optimizer.step()
                 if self.generator_ema is not None:
                     self.generator_ema.update(self.model.generator)
 
             # Train the critic
             self.critic_optimizer.zero_grad(set_to_none=True)
+            if self.lookahead_optimizer is not None:
+                self.lookahead_optimizer.zero_grad(set_to_none=True)
             extras_list = []
             batch = next(self.dataloader)
             extra = self.fwdbwd_one_step(batch, False)
             extras_list.append(extra)
             critic_log_dict = merge_dict_list(extras_list)
             self.critic_optimizer.step()
+            if self.lookahead_optimizer is not None:
+                self.lookahead_optimizer.step()
 
             # Increment the step since we finished gradient update
             self.step += 1
@@ -361,6 +467,13 @@ class Trainer:
                             "dmdtrain_gradient_norm": generator_log_dict["dmdtrain_gradient_norm"].mean().item()
                         }
                     )
+                    for key in ("lookahead_loss_exit", "lookahead_loss_context",
+                                "lookahead_lambda", "lookahead_grad_ratio"):
+                        if key in generator_log_dict:
+                            wandb_loss_dict[key] = generator_log_dict[key].mean().item()
+                if "lookahead_loss_critic_step" in critic_log_dict:
+                    wandb_loss_dict["lookahead_loss_critic_step"] = \
+                        critic_log_dict["lookahead_loss_critic_step"].mean().item()
 
                 wandb_loss_dict.update(
                     {

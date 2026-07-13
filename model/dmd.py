@@ -28,6 +28,19 @@ class DMD(SelfForcingModel):
             self.generator.enable_gradient_checkpointing()
             self.fake_score.enable_gradient_checkpointing()
 
+        # Lookahead Forcing (mtp.md): attach heads BEFORE FSDP wrapping
+        lookahead_cfg = getattr(args, "lookahead", None)
+        self.lookahead_enabled = bool(lookahead_cfg and lookahead_cfg.get("enabled", False))
+        if self.lookahead_enabled:
+            self.generator.attach_lookahead(
+                lookahead_cfg,
+                num_denoising_steps=len(args.denoising_step_list),
+                num_frame_per_block=self.num_frame_per_block
+            )
+            self.lookahead_head_updates_on_critic_steps = lookahead_cfg.get(
+                "head_updates_on_critic_steps", True)
+        self._lookahead_ctx = None
+
         # this will be init later with fsdp-wrapped modules
         self.inference_pipeline: SelfForcingTrainingPipeline = None
 
@@ -232,6 +245,14 @@ class DMD(SelfForcingModel):
             denoised_timestep_to=denoised_timestep_to
         )
 
+        # Step 3: Lookahead losses (LSC). Returned un-detached under
+        # "lookahead_losses"; the trainer composes the total (lambda-weighted
+        # exit terms + drafter terms) and runs the grad-ratio controller.
+        if self.lookahead_enabled and self._lookahead_ctx is not None:
+            dmd_log_dict["lookahead_losses"] = self.generator(
+                lookahead_inputs=self._lookahead_ctx)
+            self._lookahead_ctx = None
+
         return dmd_loss, dmd_log_dict
 
     def critic_loss(
@@ -264,6 +285,16 @@ class DMD(SelfForcingModel):
                 conditional_dict=conditional_dict,
                 initial_latent=initial_latent
             )
+
+        # Lookahead: critic-step rollouts are free drafter data — features are
+        # detached (no_grad rollout) so only head/fusion params receive
+        # gradient; computed OUTSIDE the no_grad block (mtp.md section 4).
+        critic_lookahead_losses = None
+        if self.lookahead_enabled and self._lookahead_ctx is not None:
+            if self.lookahead_head_updates_on_critic_steps:
+                critic_lookahead_losses = self.generator(
+                    lookahead_inputs=self._lookahead_ctx)
+            self._lookahead_ctx = None
 
         # Step 2: Compute the fake prediction
         min_timestep = denoised_timestep_to if self.ts_schedule and denoised_timestep_to is not None else self.min_score_timestep
@@ -328,5 +359,7 @@ class DMD(SelfForcingModel):
         critic_log_dict = {
             "critic_timestep": critic_timestep.detach()
         }
+        if critic_lookahead_losses is not None:
+            critic_log_dict["lookahead_losses"] = critic_lookahead_losses
 
         return denoising_loss, critic_log_dict

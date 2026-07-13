@@ -144,6 +144,19 @@ class WanDiffusionWrapper(torch.nn.Module):
     def enable_gradient_checkpointing(self) -> None:
         self.model.enable_gradient_checkpointing()
 
+    def attach_lookahead(self, lookahead_cfg, num_denoising_steps, num_frame_per_block) -> None:
+        """
+        Attach the Lookahead Forcing module (mtp.md). Must be called BEFORE
+        FSDP wrapping so its parameters are sharded/optimized/EMA'd with the
+        generator; invoke it through forward(lookahead_inputs=...) so FSDP
+        gathers parameters correctly.
+        """
+        # local import: utils.wan_wrapper is imported during model package init
+        from model.lookahead import LookaheadModule
+        self.lookahead = LookaheadModule(
+            lookahead_cfg, self.model, num_denoising_steps, num_frame_per_block)
+        self.lookahead.requires_grad_(True)
+
     def adding_cls_branch(self, atten_dim=1536, num_class=4, time_embed_dim=0) -> None:
         # NOTE: This is hard coded for WAN2.1-T2V-1.3B for now!!!!!!!!!!!!!!!!!!!!
         self._cls_pred_branch = nn.Sequential(
@@ -217,8 +230,8 @@ class WanDiffusionWrapper(torch.nn.Module):
 
     def forward(
         self,
-        noisy_image_or_video: torch.Tensor, conditional_dict: dict,
-        timestep: torch.Tensor, kv_cache: Optional[List[dict]] = None,
+        noisy_image_or_video: torch.Tensor = None, conditional_dict: dict = None,
+        timestep: torch.Tensor = None, kv_cache: Optional[List[dict]] = None,
         crossattn_cache: Optional[List[dict]] = None,
         current_start: Optional[int] = None,
         classify_mode: Optional[bool] = False,
@@ -226,8 +239,24 @@ class WanDiffusionWrapper(torch.nn.Module):
         clean_x: Optional[torch.Tensor] = None,
         aug_t: Optional[torch.Tensor] = None,
         cache_start: Optional[int] = None,
-        return_hidden_layers: Optional[List[int]] = None
+        return_hidden_layers: Optional[List[int]] = None,
+        lookahead_inputs: Optional[dict] = None
     ) -> torch.Tensor:
+        if lookahead_inputs is not None:
+            # Lookahead-loss mode: route through this forward so FSDP gathers
+            # the lookahead submodule's parameters
+            out = lookahead_inputs["output"]
+            _, ph, pw = self.lookahead.patch_size
+            latent_grid = (self.lookahead.num_frame_per_block,
+                           out.shape[-2] // ph, out.shape[-1] // pw)
+            return self.lookahead(
+                taps=lookahead_inputs["taps"],
+                block_meta=lookahead_inputs["block_meta"],
+                output=out,
+                conditional_dict=lookahead_inputs["conditional_dict"],
+                latent_grid=latent_grid,
+            )
+
         prompt_embeds = conditional_dict["prompt_embeds"]
 
         # [B, F] -> [B]
