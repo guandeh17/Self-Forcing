@@ -148,11 +148,22 @@ class FlowMatchScheduler():
         timestep_id = torch.argmin(
             (self.timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
         sigma = self.sigmas[timestep_id].reshape(-1, 1, 1, 1)
-        if to_final or (timestep_id + 1 >= len(self.timesteps)).any():
-            sigma_ = 1 if (
-                self.inverse_timesteps or self.reverse_sigmas) else 0
+        terminal_sigma = 1 if (
+            self.inverse_timesteps or self.reverse_sigmas) else 0
+        at_terminal = timestep_id + 1 >= len(self.timesteps)
+        if to_final:
+            sigma_ = torch.full_like(sigma, terminal_sigma)
         else:
-            sigma_ = self.sigmas[timestep_id + 1].reshape(-1, 1, 1, 1)
+            # A batch can contain samples at different points in the schedule
+            # (for example when causal frames are packed together).  Handle the
+            # endpoint per sample instead of letting one terminal item force the
+            # whole batch to jump to the endpoint.
+            next_timestep_id = (timestep_id + 1).clamp_max(len(self.timesteps) - 1)
+            next_sigma = self.sigmas[next_timestep_id].reshape(-1, 1, 1, 1)
+            terminal = torch.full_like(next_sigma, terminal_sigma)
+            sigma_ = torch.where(
+                at_terminal.reshape(-1, 1, 1, 1), terminal, next_sigma
+            )
         prev_sample = sample + model_output * (sigma_ - sigma)
         return prev_sample
 
